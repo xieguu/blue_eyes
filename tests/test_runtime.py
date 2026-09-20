@@ -252,6 +252,48 @@ class WorkClockTests(unittest.TestCase):
         self.clock.sample(True)
         self.assertEqual(self.clock.remaining_seconds, 0)
 
+    def test_snooze_keeps_countdown_and_usage_running(self):
+        self.clock.snooze(900)
+        self.source.advance(120)
+        self.assertEqual(self.clock.sample(True), 120)
+        self.assertEqual(self.clock.remaining_seconds, 180)
+        self.assertEqual(self.clock.session_seconds, 120)
+        self.assertEqual(self.clock.snooze_remaining_seconds, 780)
+
+    def test_snooze_expires_while_usage_clock_is_inactive(self):
+        self.clock.snooze(900)
+        self.clock.sample(False)
+        self.source.advance(1200)
+        self.assertEqual(self.clock.snooze_remaining_seconds, 0)
+        self.assertEqual(self.clock.sample(False), 0)
+        self.assertEqual(self.clock.remaining_seconds, 300)
+
+    def test_cancel_snooze_preserves_work_progress(self):
+        self.clock.snooze(900)
+        self.source.advance(30)
+        self.clock.sample(True)
+        self.clock.cancel_snooze()
+        self.assertEqual(self.clock.snooze_remaining_seconds, 0)
+        self.assertEqual(self.clock.remaining_seconds, 270)
+        self.assertEqual(self.clock.session_seconds, 30)
+
+    def test_replacing_snooze_restarts_deadline_and_rounds_up(self):
+        self.clock.snooze(900)
+        self.source.advance(100)
+        self.clock.snooze(1800)
+        self.source.advance(0.2)
+        self.assertEqual(self.clock.snooze_remaining_seconds, 1800)
+        self.clock.restart(600)
+        self.assertEqual(self.clock.snooze_remaining_seconds, 1800)
+
+    def test_invalid_snooze_durations_preserve_existing_deadline(self):
+        self.clock.snooze(900)
+        for duration in (0, -1, True, "900", None, float("inf"), float("nan")):
+            with self.subTest(duration=duration):
+                with self.assertRaises(ValueError):
+                    self.clock.snooze(duration)
+                self.assertEqual(self.clock.snooze_remaining_seconds, 900)
+
 
 class ActivityMonitorTests(unittest.TestCase):
     def test_unavailable_monitor_degrades_to_unknown_activity(self):

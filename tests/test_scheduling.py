@@ -28,6 +28,7 @@ class SchedulingTests(unittest.TestCase):
         self.app.is_enabled = True
         self.app.overlay = None
         self.app.pet = None
+        self.app._pet_progress = mainpro.PetProgress()
         self.app._stat_date = mainpro.date.today().isoformat()
         self.app._today_seconds = 0.0
         self.app.today_minutes = 0
@@ -72,6 +73,76 @@ class SchedulingTests(unittest.TestCase):
         self.app._update_stat()
         self.assertEqual(self.app.today_minutes, 2)
         self.assertEqual(self.app._work_clock.session_seconds, 125)
+
+    def test_snooze_suppresses_reminders_without_losing_usage(self):
+        self.app.show_rest_overlay = Mock()
+        self.assertTrue(self.app._snooze_reminders(15))
+        self.source.advance(250)
+        self.app._refresh_countdown()
+        self.app.tray.showMessage.assert_not_called()
+        self.source.advance(100)
+        self.app._refresh_countdown()
+        self.app._on_rest_trigger()
+        self.app.show_rest_overlay.assert_not_called()
+        self.assertTrue(self.app._work_clock.active)
+        self.assertEqual(self.app._today_seconds, 350)
+        self.assertEqual(self.app._next_rest_secs, 0)
+        self.assertIn("免打扰", self.app.next_rest_label.setText.call_args.args[0])
+
+    def test_snooze_expiry_delivers_overdue_reminder(self):
+        self.app.show_rest_overlay = Mock()
+        self.app._snooze_reminders(15)
+        self.source.advance(900)
+        self.app._refresh_countdown()
+        self.app.show_rest_overlay.assert_called_once_with()
+        self.assertEqual(self.app._today_seconds, 900)
+        self.assertEqual(self.app._work_clock.snooze_remaining_seconds, 0)
+
+    def test_manual_resume_keeps_remaining_work_time(self):
+        self.app.show_rest_overlay = Mock()
+        self.app._snooze_reminders(15)
+        self.source.advance(40)
+        self.app._resume_reminders()
+        self.assertEqual(self.app._next_rest_secs, 260)
+        self.assertEqual(self.app._today_seconds, 40)
+        self.app.show_rest_overlay.assert_not_called()
+
+    def test_manual_resume_delivers_already_due_reminder(self):
+        self.app.show_rest_overlay = Mock()
+        self.app._snooze_reminders(15)
+        self.source.advance(350)
+        self.app._resume_reminders()
+        self.app.show_rest_overlay.assert_called_once_with()
+        self.assertEqual(self.app._today_seconds, 350)
+
+    def test_idle_pauses_usage_but_not_snooze_expiry(self):
+        self.app.show_rest_overlay = Mock()
+        self.app._snooze_reminders(15)
+        self.source.advance(310)
+        self.app._activity.idle_seconds.return_value = 310
+        self.app._refresh_countdown()
+        self.source.advance(590)
+        self.app._activity.idle_seconds.return_value = 900
+        self.app._refresh_countdown()
+        self.app.show_rest_overlay.assert_not_called()
+        self.assertEqual(self.app._today_seconds, 300)
+        self.assertEqual(self.app._work_clock.snooze_remaining_seconds, 0)
+        self.app._activity.idle_seconds.return_value = 0
+        self.app._refresh_countdown()
+        self.app.show_rest_overlay.assert_called_once_with()
+        self.assertEqual(self.app._today_seconds, 300)
+
+    def test_snooze_cannot_interrupt_an_existing_rest(self):
+        self.app.overlay = Mock()
+        self.assertFalse(self.app._snooze_reminders(15))
+        self.assertEqual(self.app._work_clock.snooze_remaining_seconds, 0)
+
+    def test_snooze_is_rejected_when_disabled_or_quitting(self):
+        self.app.is_enabled = False
+        self.assertFalse(self.app._snooze_reminders(15))
+        self.app.is_enabled = True
+        self.app._quitting = True
+        self.assertFalse(self.app._snooze_reminders(15))
 
     def test_idle_crossing_pauses_and_input_resumes_remaining_time(self):
         self.source.advance(15)
@@ -144,6 +215,7 @@ class SchedulingTests(unittest.TestCase):
 
     def test_rest_window_is_unique_and_rest_time_is_not_counted(self):
         overlay = Mock()
+        overlay.completed = False
         overlay.isVisible.return_value = True
         with patch("mainpro.EyeExerciseOverlay", return_value=overlay) as constructor:
             self.source.advance(12)

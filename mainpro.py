@@ -1,7 +1,9 @@
 
 import sys
+import csv
 import ctypes
 import ctypes.wintypes
+import io
 import math
 import json
 import os
@@ -14,21 +16,23 @@ except ImportError:  # 允许在非 Windows 环境运行纯逻辑检查
     winreg = None
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
+from functools import lru_cache
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
     QSlider, QHBoxLayout, QFrame, QStackedWidget, QSpinBox,
     QSystemTrayIcon, QMenu, QAction, QCheckBox, QGraphicsDropShadowEffect,
-    QSizePolicy, QGridLayout, QProgressBar, QMessageBox
+    QSizePolicy, QGridLayout, QProgressBar, QMessageBox, QScrollArea, QFileDialog
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, QPointF, QRect, QRectF, pyqtSignal, QObject
+    Qt, QTimer, QPointF, QRect, QRectF, pyqtSignal, QObject,
+    QEasingCurve, QIODevice, QSaveFile, QTimeLine,
 )
 from PyQt5.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QGradient, QIcon, QLinearGradient,
     QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QTransform
 )
 from careeyes_runtime import (
-    GammaController, SingleInstance, WindowsActivityMonitor,
+    GammaController, PetProgress, SingleInstance, WindowsActivityMonitor,
     WindowsGammaBackend, WorkClock,
 )
 
@@ -37,7 +41,7 @@ from careeyes_runtime import (
 # ─────────────────────────────────────────────
 APP_NAME    = "CareEyesPro"
 APP_TITLE   = "CareEyes Pro"
-APP_VER     = "v5.2"
+APP_VER     = "v5.5"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".care_eyes_pro.json")
 IDLE_PAUSE_SECONDS = 300
 
@@ -68,6 +72,20 @@ AUTO_CURVE = {
     12: 6500, 13: 6500, 14: 6500, 15: 6200, 16: 5800, 17: 5200,
     18: 4500, 19: 4000, 20: 3500, 21: 3200, 22: 3000, 23: 2700,
 }
+
+
+def _write_atomic(path, content):
+    save_file = QSaveFile(os.fspath(path))
+    save_file.setDirectWriteFallback(False)
+    if not save_file.open(QIODevice.WriteOnly):
+        raise OSError(save_file.errorString())
+    if save_file.write(content) != len(content):
+        error = save_file.errorString()
+        save_file.cancelWriting()
+        raise OSError(error)
+    if not save_file.commit():
+        raise OSError(save_file.errorString())
+
 
 # ─────────────────────────────────────────────
 # 🎨  系统主题色读取 (#10)
@@ -398,18 +416,18 @@ class DisplayManager:
         return r / 255, g / 255, b / 255
 
     @staticmethod
-    def _build_ramp(r, g, b):
-        ramp = (ctypes.c_ushort * 256 * 3)()
+    @lru_cache(maxsize=32)
+    def _build_ramp(red, green, blue):
         try:
             channels = [max(0.0, min(1.0, float(channel)))
-                        for channel in (r, g, b)]
+                        for channel in (red, green, blue)]
         except (TypeError, ValueError):
             channels = [1.0, 1.0, 1.0]
-        for i in range(256):
-            base = i * 256
-            for channel_idx, channel in enumerate(channels):
-                ramp[channel_idx][i] = int(min(65535, channel * base))
-        return ramp
+        return tuple(
+            tuple(int(min(65535, channel * sample_index * 256))
+                  for sample_index in range(256))
+            for channel in channels
+        )
 
     @classmethod
     def apply(cls, temp_kelvin, brightness):
@@ -440,34 +458,39 @@ class SmoothTransition(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._step)
+        self._timeline = QTimeLine(1500, self)
+        self._timeline.setEasingCurve(QEasingCurve.OutCubic)
+        self._timeline.valueChanged.connect(self._step)
+        self._timeline.finished.connect(self.finished)
         self._cur_temp = 5000.0; self._cur_bright = 1.0
         self._tgt_temp = 5000.0; self._tgt_bright = 1.0
-        self._steps = 1; self._done = 0
+        self._last_temp = 5000.0; self._last_bright = 1.0
 
     def start(self, cur_temp, cur_bright, tgt_temp, tgt_bright,
               duration_ms=1500, step_ms=50):
-        self._timer.stop()
+        if self.is_active():
+            cur_temp, cur_bright = self._last_temp, self._last_bright
+        self.stop()
         self._cur_temp = float(cur_temp); self._cur_bright = float(cur_bright)
         self._tgt_temp = float(tgt_temp); self._tgt_bright = float(tgt_bright)
-        self._steps = max(1, duration_ms // step_ms)
-        self._done = 0
-        self._timer.start(step_ms)
+        self._last_temp, self._last_bright = self._cur_temp, self._cur_bright
+        self._timeline.setDuration(max(1, int(duration_ms)))
+        self._timeline.setUpdateInterval(max(1, int(step_ms)))
+        self._timeline.start()
 
-    def _step(self):
-        self._done += 1
-        t = self._done / self._steps
-        t_e = 1 - (1 - t) ** 3   # ease-out cubic
-        temp   = self._cur_temp   + (self._tgt_temp   - self._cur_temp)   * t_e
-        bright = self._cur_bright + (self._tgt_bright - self._cur_bright) * t_e
-        DisplayManager.apply(temp, bright)
-        if self._done >= self._steps:
-            self._timer.stop()
-            self.finished.emit()
+    def _step(self, progress):
+        if not self.is_active():
+            return
+        temperature = self._cur_temp + (self._tgt_temp - self._cur_temp) * progress
+        brightness = self._cur_bright + (self._tgt_bright - self._cur_bright) * progress
+        if DisplayManager.apply(temperature, brightness):
+            self._last_temp, self._last_bright = temperature, brightness
+
+    def is_active(self):
+        return self._timeline.state() == QTimeLine.Running
 
     def stop(self):
-        self._timer.stop()
+        self._timeline.stop()
 
 
 # ─────────────────────────────────────────────
@@ -554,6 +577,8 @@ class EyeExerciseOverlay(QWidget):
         self._unlock_deadline = started + min(self._lock_secs, duration_secs)
         self._can_close = False
         self._closed_emitted = False
+        self._cancelled = False
+        self.completed = False
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.showFullScreen()
@@ -690,7 +715,13 @@ class EyeExerciseOverlay(QWidget):
         event.accept()
         if not self._closed_emitted:
             self._closed_emitted = True
+            self.completed = self.remaining == 0 and not self._cancelled and not shutting_down
             self.closed.emit()
+
+    def cancel(self):
+        self._cancelled = True
+        self._can_close = True
+        self.close()
 
     def _close(self):
         self._sync_remaining()
@@ -872,19 +903,15 @@ class DesktopPet(QWidget):
     DECORATIONS = {
         "scarf": {
             "label": "薄荷围巾", "symbol": "⌁", "color": "#60d8ce",
-            "unlocked": True,
         },
         "sprout": {
             "label": "头顶小芽", "symbol": "❧", "color": "#9bd7a6",
-            "unlocked": True,
         },
         "star_pin": {
             "label": "星星别针", "symbol": "★", "color": "#e6c878",
-            "unlocked": False,
         },
         "night_cap": {
             "label": "晚安帽", "symbol": "☾", "color": "#a8b2d8",
-            "unlocked": False,
         },
     }
 
@@ -989,7 +1016,7 @@ class DesktopPet(QWidget):
                  rest_now=None, toggle_care=None, on_moved=None,
                  pet_kind=DEFAULT_PET_KIND, decoration=DEFAULT_DECORATION,
                  interaction_mode=DEFAULT_INTERACTION_MODE,
-                 on_interaction_mode_changed=None):
+                 on_interaction_mode_changed=None, outfit=None):
         super().__init__(None)
         self._open_app    = open_app
         self._hide_pet    = hide_pet
@@ -999,9 +1026,8 @@ class DesktopPet(QWidget):
         self._on_moved    = on_moved
         self._on_interaction_mode_changed = on_interaction_mode_changed
         self._pet_kind = pet_kind if pet_kind in self.PET_STYLES else self.DEFAULT_PET_KIND
-        self._decoration = (decoration if decoration in self.DECORATIONS
-                            and self.DECORATIONS[decoration]["unlocked"]
-                            else self.DEFAULT_DECORATION)
+        self._outfit = ()
+        self.set_outfit((decoration,) if outfit is None else outfit)
         self._interaction_mode = self.normalize_interaction_mode(interaction_mode)
 
         self._state = "idle"
@@ -1029,13 +1055,27 @@ class DesktopPet(QWidget):
 
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick)
-        self._anim_timer.start(60)
+        self._anim_timer.setInterval(60)
         self._msg_timer = QTimer(self)
         self._msg_timer.setSingleShot(True)
         self._msg_timer.timeout.connect(self._clear_msg)
         self._chat_timer = QTimer(self)          # 偶尔自己冒个泡
         self._chat_timer.timeout.connect(self._auto_chat)
-        self._chat_timer.start(120_000)
+        self._chat_timer.setInterval(120_000)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._anim_timer.start()
+        self._chat_timer.start()
+        if self._msg:
+            self._msg_timer.start()
+
+    def hideEvent(self, event):
+        self._anim_timer.stop()
+        self._chat_timer.stop()
+        self._msg_timer.stop()
+        self._clear_msg()
+        super().hideEvent(event)
 
     @classmethod
     def normalize_interaction_mode(cls, mode):
@@ -1550,13 +1590,20 @@ class DesktopPet(QWidget):
         self.update()
 
     def set_decoration(self, decoration: str):
-        """切换已解锁的桌宠装饰；锁定装饰只在页面展示，不接受选择。"""
+        """显示单件装饰，穿戴权限由成长模型控制。"""
         if decoration not in self.DECORATIONS:
             return
-        if not self.DECORATIONS[decoration]["unlocked"]:
-            return
-        if decoration != self._decoration:
-            self._decoration = decoration
+        self.set_outfit((decoration,))
+
+    def set_outfit(self, decorations):
+        if not isinstance(decorations, (tuple, list)):
+            raise ValueError("outfit must be a list or tuple")
+        if any(not isinstance(item, str) or item not in self.DECORATIONS
+               for item in decorations):
+            raise ValueError("unknown decoration")
+        selected = tuple(item for item in self.DECORATIONS if item in decorations)
+        if selected != self._outfit:
+            self._outfit = selected
             self.update()
 
     def set_countdown(self, left_secs: int, total_secs: int):
@@ -1569,7 +1616,9 @@ class DesktopPet(QWidget):
     def say(self, text: str, ms: int = 3200):
         self._msg = text
         if hasattr(self, "_msg_timer"):
-            self._msg_timer.start(ms)
+            self._msg_timer.setInterval(ms)
+            if self.isVisible():
+                self._msg_timer.start()
         self.update()
 
     def _clear_msg(self):
@@ -1641,7 +1690,7 @@ class DesktopPet(QWidget):
         pose.scale(motion["scale_x"], motion["scale_y"])
         pose.translate(-pivot_x, -pivot_y)
         art_top = self.ART_TOP.get(self._pet_kind, -13)
-        if self._decoration == "sprout":
+        if "sprout" in self._outfit or "night_cap" in self._outfit:
             art_top = min(art_top, -30)
         bounds = pose.mapRect(QRectF(20, top + art_top, 123, 113 - art_top))
         fit = min(1.0, (self.W - 8) / max(1, bounds.width()),
@@ -1697,7 +1746,8 @@ class DesktopPet(QWidget):
             p.drawEllipse(84, int(top + 84), 28, 15)
 
             self._paint_face(p, top)
-        self._paint_decoration(p, top, self._decoration)
+        for decoration in self._outfit:
+            self._paint_decoration(p, top, decoration)
         p.restore()
         self._paint_interaction_fx(p)
         if show_bar:
@@ -2015,7 +2065,7 @@ class DesktopPet(QWidget):
         edge = QColor(light).darker(118)
         shine = QColor(body).lighter(121)
         screen_ink = "#98e5d8" if self._state != "off" else "#93a4ad"
-        if self._decoration != "sprout":
+        if "sprout" not in self._outfit and "night_cap" not in self._outfit:
             block(73, -10, 4, 15, light)
             block(69, -14, 12, 8, "#c5b6e8" if self._state != "off" else light)
             block(71, -13, 4, 2, "#e9e2f8")
@@ -2651,7 +2701,7 @@ class PetPreview(DesktopPet):
 
     def __init__(self, pet_kind, parent=None, animated=True, halo=True,
                  decoration=DesktopPet.DEFAULT_DECORATION,
-                 interaction_mode=DesktopPet.DEFAULT_INTERACTION_MODE):
+                 interaction_mode=DesktopPet.DEFAULT_INTERACTION_MODE, outfit=None):
         QWidget.__init__(self, parent)
         self._pet_kind = (pet_kind if pet_kind in self.PET_STYLES
                           else self.DEFAULT_PET_KIND)
@@ -2665,20 +2715,28 @@ class PetPreview(DesktopPet):
         self._total_secs = 0
         self._msg = ""
         self._halo = halo
+        self._animated = animated
         self._interaction_mode = self.normalize_interaction_mode(interaction_mode)
         self._on_interaction_mode_changed = None
         self._init_interaction_state()
-        self._decoration = (decoration if decoration in self.DECORATIONS
-                            and self.DECORATIONS[decoration]["unlocked"]
-                            else self.DEFAULT_DECORATION)
+        self._outfit = ()
+        self.set_outfit((decoration,) if outfit is None else outfit)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setStyleSheet("background:transparent;border:none;")
 
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._tick_preview)
-        if animated:
-            self._preview_timer.start(80)
+        self._preview_timer.setInterval(80)
+
+    def showEvent(self, event):
+        QWidget.showEvent(self, event)
+        if self._animated:
+            self._preview_timer.start()
+
+    def hideEvent(self, event):
+        self._preview_timer.stop()
+        QWidget.hideEvent(self, event)
 
     def _tick_preview(self):
         self._phase += 0.08
@@ -2697,15 +2755,9 @@ class PetPreview(DesktopPet):
             self._pet_kind = pet_kind
             self.update()
 
-    def set_decoration(self, decoration):
-        if (decoration in self.DECORATIONS
-                and self.DECORATIONS[decoration]["unlocked"]
-                and decoration != self._decoration):
-            self._decoration = decoration
-            self.update()
-
     def set_state(self, state):
-        if state in self.PET_STYLES[self._pet_kind]["palette"]:
+        if (state != self._state
+                and state in self.PET_STYLES[self._pet_kind]["palette"]):
             self._state = state
             self.update()
 
@@ -2762,7 +2814,9 @@ class PetSkinCard(QPushButton):
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setMinimumWidth(92)
-        self.setFixedHeight(82)
+        self.setMinimumHeight(82)
+        self.setMaximumHeight(112)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet("""
             QPushButton { background:#172232; border:1px solid #273649;
                 border-radius:10px; }
@@ -2772,14 +2826,115 @@ class PetSkinCard(QPushButton):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 3, 5, 5)
         layout.setSpacing(0)
-        preview = PetPreview(pet_kind, self, animated=False, halo=False)
-        preview.setFixedHeight(58)
-        layout.addWidget(preview)
+        self.preview = PetPreview(pet_kind, self, animated=False, halo=False)
+        self.preview.setMinimumHeight(58)
+        layout.addWidget(self.preview, 1)
         label = QLabel(info["label"])
         label.setAlignment(Qt.AlignCenter)
         label.setAttribute(Qt.WA_TransparentForMouseEvents)
         label.setStyleSheet("background:transparent;border:none;color:#b8c5d5;font-size:11px;")
         layout.addWidget(label)
+
+
+class PetDecorationPreview(PetPreview):
+    ICON_BOUNDS = {
+        "scarf": QRectF(40, 60, 72, 40),
+        "sprout": QRectF(56, -28, 42, 36),
+        "star_pin": QRectF(100, -3, 23, 23),
+        "night_cap": QRectF(43, -20, 65, 37),
+    }
+
+    def __init__(self, decoration, parent=None):
+        super().__init__("seagull", parent, animated=False, halo=False,
+                         decoration=decoration)
+
+    def paintEvent(self, event):
+        decoration = self._outfit[0]
+        bounds = self.ICON_BOUNDS[decoration]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if not self.isEnabled():
+            painter.setOpacity(0.38)
+        scale = min(max(1, self.width() - 6) / bounds.width(),
+                    max(1, self.height() - 4) / bounds.height())
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.scale(scale, scale)
+        painter.translate(-bounds.center())
+        self._paint_decoration(painter, 0, decoration)
+
+
+class PetOutfitCard(QPushButton):
+    def __init__(self, decoration, parent=None):
+        super().__init__(parent)
+        self.decoration = decoration
+        self._status = None
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(86)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setAccessibleName(DesktopPet.DECORATIONS[decoration]["label"])
+        self.setStyleSheet(
+            "QPushButton{background:#192737;border:1px solid #2c3d4e;border-radius:9px;}"
+            "QPushButton:hover{background:#213749;border-color:#567a88;}"
+            "QPushButton:checked{background:#1b393e;border-color:#60d8ce;}"
+            "QPushButton:disabled{background:#172231;border-color:#263443;}"
+            "QLabel{background:transparent;border:none;color:#a1b9c9;font-size:10px;}"
+            "QLabel:disabled{color:#65788e;}"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 4, 5, 5)
+        layout.setSpacing(2)
+        icon_row = QHBoxLayout()
+        icon_row.setSpacing(0)
+        self.icon = PetDecorationPreview(decoration, self)
+        self.icon.setFixedHeight(38)
+        self.marker = QLabel()
+        self.marker.setFixedWidth(12)
+        self.marker.setAlignment(Qt.AlignTop | Qt.AlignRight)
+        icon_row.addWidget(self.icon, 1)
+        icon_row.addWidget(self.marker)
+        layout.addLayout(icon_row)
+        label = QLabel(DesktopPet.DECORATIONS[decoration]["label"])
+        label.setAlignment(Qt.AlignCenter)
+        self.detail = QLabel()
+        self.detail.setAlignment(Qt.AlignCenter)
+        self.detail.setStyleSheet("font-size:9px;color:#7f9ba9;")
+        layout.addWidget(label)
+        layout.addWidget(self.detail)
+        for child in self.findChildren(QLabel):
+            child.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def set_status(self, unlocked, equipped, remaining):
+        status = (unlocked, equipped, remaining)
+        if status == self._status:
+            return
+        self._status = status
+        self.setEnabled(unlocked)
+        self.setChecked(equipped)
+        self.marker.setText("✓" if equipped else "")
+        self.marker.setStyleSheet("color:#60d8ce;font-size:12px;font-weight:700;")
+        self.detail.setText(
+            "已穿戴" if equipped else ("点击穿戴" if unlocked else f"还需 {remaining} 次")
+        )
+        if unlocked:
+            hint = "点击脱下" if equipped else "点击穿戴"
+            if PetProgress.OUTFIT_RULES[self.decoration]["slot"] == "head":
+                hint += "；小芽与晚安帽共用头饰位置"
+        else:
+            hint = f"再完整完成 {remaining} 次休息解锁，跳过休息不计入成长"
+        self.setToolTip(hint)
+        self.setAccessibleDescription(hint)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._status is not None and not self._status[0]:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(QPen(QColor("#708096"), 1.4))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(QRectF(self.width() - 15, 7, 6, 8), 0, 180 * 16)
+            painter.setBrush(QColor("#708096"))
+            painter.drawRoundedRect(QRectF(self.width() - 16, 11, 8, 7), 1.5, 1.5)
 
 
 class CareEyesApp(QWidget):
@@ -2795,6 +2950,7 @@ class CareEyesApp(QWidget):
         self._suspended = False
         self._rest_deferred = False
         self._pause_reason = ""
+        self._settings_error = ""
         self.overlay = None
         self.pet = None
         # ── 读取系统主题色 (#10) ──
@@ -2873,8 +3029,8 @@ class CareEyesApp(QWidget):
         # 系统状态只用于展示，单独采样，避免影响护眼/休息定时器。
         self.metrics_timer = QTimer(self)
         self.metrics_timer.timeout.connect(self._refresh_system_metrics)
-        self.metrics_timer.start(2_000)
-        QTimer.singleShot(0, self._refresh_system_metrics)
+        self.metrics_timer.setInterval(2_000)
+        self.pages.currentChanged.connect(self._sync_metrics_timer)
 
         # #3 多显示器热插拔监听
         QApplication.instance().primaryScreenChanged.connect(self._on_screen_change)
@@ -2896,6 +3052,7 @@ class CareEyesApp(QWidget):
             toggle_care=self._hk_toggle,
             on_moved=self._on_pet_moved,
             pet_kind=self.pet_kind,
+            outfit=self._pet_progress.outfit,
             interaction_mode=self.pet_interaction_mode,
             on_interaction_mode_changed=self._on_pet_interaction_mode_changed,
         )
@@ -2950,6 +3107,74 @@ class CareEyesApp(QWidget):
         if self.pet is not None:
             self.pet.trigger_surprise()
 
+    def _toggle_pet_decoration(self, decoration):
+        if self._pet_progress.toggle_decoration(decoration):
+            self._sync_pet_progress()
+            self._save_settings()
+
+    def _sync_pet_progress(self):
+        progress = self._pet_progress
+        if self.pet is not None:
+            self.pet.set_outfit(progress.outfit)
+        controls = vars(self)
+        preview = controls.get("pet_preview")
+        if preview is not None:
+            preview.set_outfit(progress.outfit)
+        if "pet_level_label" not in controls:
+            return
+        self.pet_level_label.setText(f"Lv. {progress.level}")
+        self.pet_experience_label.setText(
+            f"{progress.level_experience} / {progress.experience_per_level} 成长值"
+        )
+        self.pet_experience_progress.setRange(0, progress.experience_per_level)
+        self.pet_experience_progress.setValue(progress.level_experience)
+        self.pet_growth_label.setText(
+            f"累计完成 {progress.completed_rests} 次休息 · {progress.experience} 成长值"
+        )
+        for decoration, button in self.pet_outfit_buttons.items():
+            required = PetProgress.OUTFIT_RULES[decoration]["rests"]
+            button.set_status(
+                progress.is_unlocked(decoration), decoration in progress.outfit,
+                max(0, required - progress.completed_rests),
+            )
+        for button in self.pet_skin_buttons.values():
+            button.preview.set_outfit(progress.outfit)
+        reward = progress.next_unlock
+        if reward is None:
+            self.pet_reward_icon.set_decoration("star_pin")
+            self.pet_reward_title.setText("衣柜已集齐")
+            self.pet_reward_remaining.setText("继续休息，陪伴等级继续成长")
+            self.pet_reward_progress.setRange(0, 1)
+            self.pet_reward_progress.setValue(1)
+            self.pet_reward_count.setText("4 / 4")
+        else:
+            decoration, required = reward
+            self.pet_reward_icon.set_decoration(decoration)
+            self.pet_reward_title.setText(
+                f"下一个礼物 · {DesktopPet.DECORATIONS[decoration]['label']}"
+            )
+            self.pet_reward_remaining.setText(
+                f"再完成 {required - progress.completed_rests} 次休息解锁"
+            )
+            self.pet_reward_progress.setRange(0, required)
+            self.pet_reward_progress.setValue(progress.completed_rests)
+            self.pet_reward_count.setText(f"{progress.completed_rests} / {required}")
+
+    def _complete_pet_rest(self):
+        previous_level = self._pet_progress.level
+        unlocked = self._pet_progress.complete_rest()
+        self._sync_pet_progress()
+        self._save_settings()
+        message = f"休息完成，成长值 +{PetProgress.EXPERIENCE_PER_REST}"
+        if self._pet_progress.level > previous_level:
+            message += f" · 升至 Lv. {self._pet_progress.level}"
+        if unlocked:
+            names = "、".join(DesktopPet.DECORATIONS[item]["label"] for item in unlocked)
+            message += f" · 解锁{names}"
+        self.tray.showMessage(APP_TITLE, message, QSystemTrayIcon.Information, 5000)
+        if self.pet is not None:
+            self.pet.say(message, 5000)
+
     def _open_main(self):
         self.show()
         self.raise_()
@@ -2959,12 +3184,13 @@ class CareEyesApp(QWidget):
         self.pet_pos = [int(x), int(y)]
         self._schedule_save()
 
-    def _pet_state(self):
+    def _pet_state(self, refresh_page=True):
         """根据当前护眼/休息状态推导桌宠表情。"""
         state = self._current_pet_state()
         if self.pet is not None:
             self.pet.set_state(state)
-        self._sync_pet_page()
+        if refresh_page:
+            self._sync_pet_page()
 
     def _on_pet_toggle(self, state):
         self.pet_enabled = bool(state)
@@ -3007,7 +3233,7 @@ class CareEyesApp(QWidget):
         pet_visibility_button = controls.get("pet_visibility_button")
         if pet_visibility_button is not None:
             pet_visibility_button.setText(
-                "✓  正在使用" if self.pet_enabled else "显示桌宠"
+                "正在使用" if self.pet_enabled else "显示桌宠"
             )
         pet_preview = controls.get("pet_preview")
         if pet_preview is not None:
@@ -3333,6 +3559,20 @@ class CareEyesApp(QWidget):
         self.fullscreen_warn = QLabel("")
         self.fullscreen_warn.setStyleSheet("color:#f97316;font-size:12px;")
         cl.addWidget(self.fullscreen_warn)
+        self.snooze_status_label = QLabel("暂缓只影响提醒，护眼与用眼统计继续运行")
+        self.snooze_status_label.setStyleSheet("color:#8b949e;font-size:11px;")
+        self.snooze_status_label.setWordWrap(True)
+        cl.addWidget(self.snooze_status_label)
+        snooze_row = QHBoxLayout()
+        self.snooze_button = QPushButton("免打扰")
+        self.snooze_button.setMenu(self._create_snooze_menu())
+        self.resume_reminders_button = QPushButton("恢复提醒")
+        self.resume_reminders_button.clicked.connect(self._resume_reminders)
+        self.resume_reminders_button.setEnabled(False)
+        snooze_row.addWidget(self.snooze_button)
+        snooze_row.addWidget(self.resume_reminders_button)
+        snooze_row.addStretch()
+        cl.addLayout(snooze_row)
         lay.addWidget(card)
 
         scard = self._card(); sl = QVBoxLayout(scard)
@@ -3369,7 +3609,18 @@ class CareEyesApp(QWidget):
     def _page_stats(self):
         page = QWidget(); lay = QVBoxLayout(page)
         lay.setContentsMargins(24,20,24,20); lay.setSpacing(12)
-        lay.addWidget(self._h2("用眼统计"))
+        header = QHBoxLayout()
+        header.addWidget(self._h2("用眼统计"))
+        header.addStretch()
+        self.export_stats_button = QPushButton("导出 CSV")
+        self.export_stats_button.setToolTip("导出最近 32 个自然日内已有的每日用眼分钟数，含今天")
+        self.export_stats_button.clicked.connect(self._export_statistics)
+        header.addWidget(self.export_stats_button)
+        lay.addLayout(header)
+        self.export_status_label = QLabel("")
+        self.export_status_label.setStyleSheet("color:#8b949e;font-size:11px;")
+        self.export_status_label.setWordWrap(True)
+        lay.addWidget(self.export_status_label)
 
         cr = QHBoxLayout(); cr.setSpacing(10)
         for lbl_t, attr, unit, color in [
@@ -3449,23 +3700,40 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     def _page_pet(self):
         page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 18, 24, 18)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.pet_scroll = QScrollArea()
+        self.pet_scroll.setWidgetResizable(True)
+        self.pet_scroll.setFrameShape(QFrame.NoFrame)
+        self.pet_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pet_scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollBar:vertical{width:6px;background:#101c29;margin:2px;}"
+            "QScrollBar::handle:vertical{background:#30485a;min-height:24px;border-radius:3px;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+        )
+        self.pet_page_body = QWidget()
+        self.pet_scroll.setWidget(self.pet_page_body)
+        outer.addWidget(self.pet_scroll)
+        lay = QVBoxLayout(self.pet_page_body)
+        lay.setContentsMargins(22, 16, 22, 16)
         lay.setSpacing(12)
 
         heading = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(3)
         title_box.addWidget(self._h2("给休息，找个小搭子。"))
-        subtitle = QLabel("认真工作，也好好休息。让每一次放松，都有个小家伙陪着。")
+        subtitle = QLabel("认真工作，也好好休息。让每一次放松，都变成一点小小的成长。")
+        subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color:#8295ac;font-size:12px;")
         title_box.addWidget(subtitle)
-        heading.addLayout(title_box)
-        heading.addStretch()
+        heading.addLayout(title_box, 1)
+        heading.addSpacing(16)
 
         status_pill = QFrame()
+        status_pill.setObjectName("petStatusPill")
         status_pill.setStyleSheet(
-            "background:#132a30;border:1px solid #254147;border-radius:18px;"
+            "QFrame#petStatusPill{background:#132a30;border:1px solid #254147;border-radius:18px;}"
         )
         status_layout = QHBoxLayout(status_pill)
         status_layout.setContentsMargins(14, 4, 9, 4)
@@ -3523,8 +3791,9 @@ class CareEyesApp(QWidget):
         self.pet_preview = PetPreview(
             self.pet_kind, hero, animated=True, halo=True,
             interaction_mode=self.pet_interaction_mode,
+            outfit=self._pet_progress.outfit,
         )
-        self.pet_preview.setMinimumSize(300, 250)
+        self.pet_preview.setMinimumSize(250, 200)
         self.pet_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         hero_layout.addWidget(self.pet_preview, 1)
 
@@ -3540,7 +3809,18 @@ class CareEyesApp(QWidget):
         self.pet_tagline_label.setStyleSheet(
             "color:#92a9ba;font-size:11px;background:transparent;"
         )
-        pet_text.addWidget(self.pet_name_label)
+        name_row = QHBoxLayout()
+        name_row.setSpacing(10)
+        name_row.addWidget(self.pet_name_label)
+        self.pet_level_label = QLabel()
+        self.pet_level_label.setAlignment(Qt.AlignCenter)
+        self.pet_level_label.setStyleSheet(
+            "color:#a6e7d6;background:#244448;border:none;border-radius:8px;"
+            "padding:3px 8px;font-size:10px;font-weight:700;"
+        )
+        name_row.addWidget(self.pet_level_label, 0, Qt.AlignVCenter)
+        name_row.addStretch()
+        pet_text.addLayout(name_row)
         pet_text.addWidget(self.pet_tagline_label)
         pet_info.addLayout(pet_text, 1)
         self.pet_visibility_button = QPushButton()
@@ -3556,6 +3836,30 @@ class CareEyesApp(QWidget):
         )
         pet_info.addWidget(self.pet_visibility_button, 0, Qt.AlignBottom)
         hero_layout.addLayout(pet_info)
+        hero_layout.addSpacing(6)
+        growth_row = QHBoxLayout()
+        growth_title = QLabel("陪伴成长")
+        growth_title.setStyleSheet("color:#a7bfca;font-size:10px;background:transparent;")
+        self.pet_experience_label = QLabel()
+        self.pet_experience_label.setStyleSheet(
+            "color:#84b8bd;font-size:10px;background:transparent;"
+        )
+        growth_row.addWidget(growth_title)
+        growth_row.addStretch()
+        growth_row.addWidget(self.pet_experience_label)
+        hero_layout.addLayout(growth_row)
+        self.pet_experience_progress = QProgressBar()
+        self.pet_experience_progress.setTextVisible(False)
+        self.pet_experience_progress.setStyleSheet(
+            "QProgressBar{background:#243d4c;border:none;border-radius:3px;}"
+            "QProgressBar::chunk{background:#60d8ce;border-radius:3px;}"
+        )
+        hero_layout.addWidget(self.pet_experience_progress)
+        self.pet_growth_label = QLabel()
+        self.pet_growth_label.setStyleSheet(
+            "color:#7e9dab;font-size:10px;background:transparent;"
+        )
+        hero_layout.addWidget(self.pet_growth_label)
         content.addWidget(hero, 5)
 
         side = QVBoxLayout()
@@ -3572,7 +3876,7 @@ class CareEyesApp(QWidget):
             "color:#edf4ff;font-size:14px;font-weight:700;"
             "background:transparent;border:none;"
         )
-        skin_count = QLabel(f"{len(DesktopPet.PET_STYLES)} 款外观")
+        skin_count = QLabel(f"{len(DesktopPet.PET_STYLES)} 款外观 · 共享成长")
         skin_count.setFixedHeight(22)
         skin_count.setStyleSheet(
             "color:#8295ac;font-size:10px;background:transparent;border:none;"
@@ -3587,43 +3891,148 @@ class CareEyesApp(QWidget):
         skin_grid.setHorizontalSpacing(7)
         skin_grid.setVerticalSpacing(7)
         self.pet_skin_buttons = {}
-        for index, (pet_kind, info) in enumerate(DesktopPet.PET_STYLES.items()):
+        self.pet_more_skins = QWidget()
+        more_grid = QGridLayout(self.pet_more_skins)
+        more_grid.setContentsMargins(0, 0, 0, 0)
+        more_grid.setSpacing(7)
+        pet_order = list(DesktopPet.FEATURED_PETS) + [
+            kind for kind in DesktopPet.PET_STYLES if kind not in DesktopPet.FEATURED_PETS
+        ]
+        for index, pet_kind in enumerate(pet_order):
+            info = DesktopPet.PET_STYLES[pet_kind]
             button = PetSkinCard(pet_kind, info, skin_card)
             button.clicked.connect(
                 lambda _, kind=pet_kind: self._select_pet_skin(kind)
             )
             self.pet_skin_buttons[pet_kind] = button
-            skin_grid.addWidget(button, index // 3, index % 3)
+            if index < 3:
+                skin_grid.addWidget(button, 0, index)
+            else:
+                more_grid.addWidget(button, (index - 3) // 3, (index - 3) % 3)
         for column in range(3):
             skin_grid.setColumnStretch(column, 1)
-        skin_layout.addLayout(skin_grid)
-        skin_layout.setStretch(0, 0)
-        skin_layout.setStretch(1, 1)
+            more_grid.setColumnStretch(column, 1)
+        skin_layout.addLayout(skin_grid, 1)
+        self.pet_more_button = QPushButton("更多外观 · 6 款")
+        self.pet_more_button.setCheckable(True)
+        self.pet_more_button.setCursor(Qt.PointingHandCursor)
+        self.pet_more_button.setFixedHeight(22)
+        self.pet_more_button.setStyleSheet(
+            "QPushButton{background:transparent;border:none;color:#87abbc;font-size:10px;}"
+            "QPushButton:checked{color:#60d8ce;}"
+        )
+        self.pet_more_button.toggled.connect(self.pet_more_skins.setVisible)
+        skin_layout.addWidget(self.pet_more_button)
+        skin_layout.addWidget(self.pet_more_skins)
+        self.pet_more_skins.hide()
         side.addWidget(skin_card, 1)
 
+        wardrobe = self._card()
+        wardrobe_layout = QVBoxLayout(wardrobe)
+        wardrobe_layout.setContentsMargins(13, 10, 13, 11)
+        wardrobe_layout.setSpacing(6)
+        wardrobe_title = QLabel("今天，穿什么？")
+        wardrobe_title.setStyleSheet(
+            "color:#edf4ff;font-size:14px;font-weight:700;background:transparent;border:none;"
+        )
+        wardrobe_layout.addWidget(wardrobe_title)
+        wardrobe_hint = QLabel("完整休息获得奖励，点击穿戴或脱下。")
+        wardrobe_hint.setWordWrap(True)
+        wardrobe_hint.setStyleSheet(
+            "color:#8295ac;font-size:10px;background:transparent;border:none;"
+        )
+        wardrobe_hint.setToolTip("围巾与别针可以叠穿；小芽和晚安帽共用一个头饰位置。")
+        wardrobe_layout.addWidget(wardrobe_hint)
+        outfit_row = QHBoxLayout()
+        outfit_row.setSpacing(6)
+        self.pet_outfit_buttons = {}
+        for decoration in DesktopPet.DECORATIONS:
+            button = PetOutfitCard(decoration, wardrobe)
+            button.clicked.connect(
+                lambda _, selected=decoration: self._toggle_pet_decoration(selected)
+            )
+            self.pet_outfit_buttons[decoration] = button
+            outfit_row.addWidget(button, 1)
+        wardrobe_layout.addLayout(outfit_row)
+        side.addWidget(wardrobe)
+
+        reward = self._card()
+        reward.setMaximumHeight(100)
+        reward.setStyleSheet(
+            "QFrame{background:#192833;border:1px solid #33434d;border-radius:10px;}"
+            "QLabel{background:transparent;border:none;}"
+        )
+        reward_layout = QHBoxLayout(reward)
+        reward_layout.setContentsMargins(13, 10, 13, 10)
+        reward_layout.setSpacing(10)
+        self.pet_reward_icon = PetDecorationPreview("star_pin", reward)
+        self.pet_reward_icon.setFixedSize(42, 46)
+        reward_layout.addWidget(self.pet_reward_icon)
+        reward_text = QVBoxLayout()
+        reward_text.setSpacing(5)
+        self.pet_reward_title = QLabel()
+        self.pet_reward_title.setWordWrap(True)
+        self.pet_reward_title.setStyleSheet("color:#dacc9d;font-size:11px;font-weight:700;")
+        reward_text.addWidget(self.pet_reward_title)
+        reward_bar = QHBoxLayout()
+        self.pet_reward_progress = QProgressBar()
+        self.pet_reward_progress.setTextVisible(False)
+        self.pet_reward_progress.setStyleSheet(
+            "QProgressBar{background:#34424c;border:none;border-radius:3px;}"
+            "QProgressBar::chunk{background:#d7c080;border-radius:3px;}"
+        )
+        self.pet_reward_count = QLabel()
+        self.pet_reward_count.setStyleSheet("color:#c0b693;font-size:10px;")
+        reward_bar.addWidget(self.pet_reward_progress, 1)
+        reward_bar.addWidget(self.pet_reward_count)
+        reward_text.addLayout(reward_bar)
+        self.pet_reward_remaining = QLabel()
+        self.pet_reward_remaining.setWordWrap(True)
+        self.pet_reward_remaining.setStyleSheet("color:#95a0a6;font-size:10px;")
+        reward_text.addWidget(self.pet_reward_remaining)
+        reward_layout.addLayout(reward_text, 1)
+        side.addWidget(reward)
+        content.addLayout(side, 4)
+        lay.addLayout(content, 1)
+
         companion = self._card()
+        companion.setObjectName("petCompanion")
+        companion.setStyleSheet(
+            "QFrame#petCompanion{background:#15212e;border:1px solid #293e4d;border-radius:10px;}"
+            "QLabel{background:transparent;border:none;}"
+        )
         companion_layout = QVBoxLayout(companion)
         companion_layout.setContentsMargins(14, 10, 14, 11)
         companion_layout.setSpacing(5)
         companion_head = QHBoxLayout()
-        companion_title = QLabel("陪伴状态")
+        companion_title = QLabel("下一次休息")
         companion_title.setStyleSheet("color:#edf4ff;font-weight:700;")
         self.pet_mood_label = QLabel()
         self.pet_mood_label.setStyleSheet("color:#60d8ce;font-size:11px;")
         companion_head.addWidget(companion_title)
-        companion_head.addStretch()
-        companion_head.addWidget(self.pet_mood_label)
-        companion_layout.addLayout(companion_head)
         self.pet_next_rest_label = QLabel()
-        self.pet_next_rest_label.setStyleSheet("color:#9fb0c3;font-size:11px;")
-        companion_layout.addWidget(self.pet_next_rest_label)
+        self.pet_next_rest_label.setStyleSheet("color:#bacddc;font-size:12px;")
+        companion_head.addWidget(self.pet_next_rest_label, 1)
+        companion_head.addWidget(self.pet_mood_label)
+        self.pet_play_toggle = QPushButton("互动玩法")
+        self.pet_play_toggle.setCheckable(True)
+        self.pet_play_toggle.setCursor(Qt.PointingHandCursor)
+        self.pet_play_toggle.setFixedSize(76, 25)
+        self.pet_play_toggle.setStyleSheet(
+            "QPushButton{background:#21374a;color:#a6c9d8;border:none;border-radius:7px;"
+            "font-size:10px;}QPushButton:checked{background:#1d474b;color:#b9eee1;}"
+        )
+        companion_head.addWidget(self.pet_play_toggle)
+        companion_layout.addLayout(companion_head)
         self.pet_page_progress = QProgressBar()
         self.pet_page_progress.setRange(0, 100)
         self.pet_page_progress.setTextVisible(False)
         companion_layout.addWidget(self.pet_page_progress)
 
-        companion_layout.addSpacing(3)
-        companion_layout.addWidget(self._div())
+        self.pet_play_panel = QWidget()
+        play_layout = QVBoxLayout(self.pet_play_panel)
+        play_layout.setContentsMargins(0, 6, 0, 0)
+        play_layout.setSpacing(6)
         play_head = QHBoxLayout()
         play_title = QLabel("互动玩法")
         play_title.setStyleSheet("color:#dce7f2;font-size:12px;font-weight:700;")
@@ -3639,13 +4048,13 @@ class CareEyesApp(QWidget):
         play_head.addWidget(play_title)
         play_head.addStretch()
         play_head.addWidget(self.pet_surprise_button)
-        companion_layout.addLayout(play_head)
+        play_layout.addLayout(play_head)
         self.pet_interaction_hint_label = QLabel()
         self.pet_interaction_hint_label.setWordWrap(True)
         self.pet_interaction_hint_label.setStyleSheet(
             "color:#8295ac;font-size:10px;background:transparent;"
         )
-        companion_layout.addWidget(self.pet_interaction_hint_label)
+        play_layout.addWidget(self.pet_interaction_hint_label)
         interaction_row = QHBoxLayout()
         interaction_row.setSpacing(4)
         self.pet_interaction_buttons = {}
@@ -3667,12 +4076,14 @@ class CareEyesApp(QWidget):
             )
             self.pet_interaction_buttons[mode] = button
             interaction_row.addWidget(button)
-        companion_layout.addLayout(interaction_row)
-        side.addWidget(companion)
-        content.addLayout(side, 4)
-        lay.addLayout(content, 1)
+        play_layout.addLayout(interaction_row)
+        companion_layout.addWidget(self.pet_play_panel)
+        self.pet_play_toggle.toggled.connect(self.pet_play_panel.setVisible)
+        self.pet_play_panel.hide()
+        lay.addWidget(companion)
 
         self._sync_pet_page()
+        self._sync_pet_progress()
         return page
 
     def _select_pet_skin(self, pet_kind):
@@ -3720,9 +4131,14 @@ class CareEyesApp(QWidget):
             vl=QLabel(v); vl.setStyleSheet("color:#8b949e;")
             row.addWidget(kl); row.addStretch(); row.addWidget(vl)
             il.addLayout(row)
+        self.config_status_label = QLabel("设置自动保存")
+        self.config_status_label.setStyleSheet("color:#8b949e;font-size:11px;")
+        self.config_status_label.setWordWrap(True)
+        il.addWidget(self.config_status_label)
         lay.addWidget(ic)
 
         rb = QPushButton("◯  重置所有设置"); rb.setFixedHeight(35)
+        rb.setToolTip("恢复默认设置，并清空用眼统计、陪伴成长和服装选择")
         rb.setStyleSheet("QPushButton{background:transparent;color:#f85149;"
                          "border:1px solid #f85149;border-radius:8px;}"
                          "QPushButton:hover{background:rgba(248,81,73,0.1);}")
@@ -3753,6 +4169,14 @@ class CareEyesApp(QWidget):
         self.pet_action.setChecked(self.pet_enabled)
         self.pet_action.toggled.connect(self._on_pet_toggle)
         menu.insertAction(menu.actions()[2], self.pet_action)
+        exit_action = menu.actions()[-1]
+        self.snooze_tray_menu = self._create_snooze_menu()
+        menu.insertMenu(exit_action, self.snooze_tray_menu)
+        self.resume_reminders_action = QAction("恢复休息提醒", self)
+        self.resume_reminders_action.triggered.connect(self._resume_reminders)
+        self.resume_reminders_action.setEnabled(False)
+        menu.insertAction(exit_action, self.resume_reminders_action)
+        menu.insertSeparator(exit_action)
         self.tray.setContextMenu(menu)
         self.tray.setToolTip(f"{APP_TITLE} — 运行中")
         self.tray.activated.connect(lambda r: self._open_main() if r==QSystemTrayIcon.DoubleClick else None)
@@ -3774,9 +4198,11 @@ class CareEyesApp(QWidget):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()
+        preview = vars(self).get("pet_preview")
+        if preview is not None:
+            preview._preview_timer.stop()
         if self.overlay is not None:
-            self.overlay._can_close = True
-            self.overlay.close()
+            self.overlay.cancel()
         self._dim_mgr.hide()
         if self.pet is not None:
             self.pet.close()
@@ -3834,6 +4260,28 @@ class CareEyesApp(QWidget):
     # ══════════════════════════════════════════
     #  逻辑
     # ══════════════════════════════════════════
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_metrics_timer()
+
+    def hideEvent(self, event):
+        timer = vars(self).get("metrics_timer")
+        if timer is not None:
+            timer.stop()
+        super().hideEvent(event)
+
+    def _sync_metrics_timer(self):
+        timer = vars(self).get("metrics_timer")
+        if timer is None:
+            return
+        if (self._quitting or not self.isVisible() or self.isMinimized()
+                or self.pages.currentIndex() != 2):
+            timer.stop()
+        elif not timer.isActive():
+            self._metrics.reset_cpu_baseline()
+            self._refresh_system_metrics()
+            timer.start()
+
     def _nav(self, idx):
         for i,btn in enumerate(self.nav_btns): btn.setChecked(i==idx)
         self.pages.setCurrentIndex(idx)
@@ -3896,7 +4344,7 @@ class CareEyesApp(QWidget):
             DisplayManager.apply(self.temp, self.bright)
 
     def _guard_apply(self):
-        if self.is_enabled and not self._quitting and not self._transition._timer.isActive():
+        if self.is_enabled and not self._quitting and not self._transition.is_active():
             DisplayManager.apply(self.temp, self.bright)
 
     def apply_timer_settings(self):
@@ -3914,6 +4362,32 @@ class CareEyesApp(QWidget):
         self._warned_1min = False
         self._work_clock.restart(self.rest_interval_min * 60, reset_session)
         self._next_rest_secs = self._work_clock.remaining_seconds
+
+    def _create_snooze_menu(self):
+        menu = QMenu("暂缓休息提醒", self)
+        menu.setStyleSheet(
+            "QMenu{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:4px;}"
+            "QMenu::item:selected{background:#21262d;}"
+            "QMenu::item:disabled{color:#484f58;}"
+        )
+        for minutes in (15, 30, 60):
+            action = menu.addAction(f"{minutes} 分钟")
+            action.triggered.connect(
+                lambda checked=False, minutes=minutes: self._snooze_reminders(minutes)
+            )
+        return menu
+
+    def _snooze_reminders(self, minutes):
+        if self._quitting or not self.is_enabled or self.overlay is not None:
+            return False
+        self._sync_work_clock()
+        self._work_clock.snooze(minutes * 60)
+        self._refresh_countdown_label()
+        return True
+
+    def _resume_reminders(self):
+        self._work_clock.cancel_snooze()
+        self._refresh_countdown()
 
     def _sync_work_clock(self):
         clock = getattr(self, "_work_clock", None)
@@ -3951,11 +4425,31 @@ class CareEyesApp(QWidget):
         self._next_rest_secs = clock.remaining_seconds
 
     def _refresh_countdown_label(self):
+        snooze_seconds = self._work_clock.snooze_remaining_seconds
+        can_snooze = self.is_enabled and self.overlay is None and not self._quitting
+        for name in ("snooze_button", "snooze_tray_menu"):
+            control = vars(self).get(name)
+            if control is not None:
+                control.setEnabled(can_snooze)
+        for name in ("resume_reminders_button", "resume_reminders_action"):
+            control = vars(self).get(name)
+            if control is not None:
+                control.setEnabled(snooze_seconds > 0 and not self._quitting)
+        status = vars(self).get("snooze_status_label")
+        if status is not None:
+            if snooze_seconds:
+                minutes, seconds = divmod(snooze_seconds, 60)
+                status.setText(f"{minutes:02d}:{seconds:02d} 后恢复提醒 · 护眼与统计不受影响")
+            else:
+                status.setText("暂缓只影响提醒，护眼与用眼统计继续运行")
         if not self.is_enabled:
             self.next_rest_label.setText("已暂停")
             return
         if self.overlay is not None:
             self.next_rest_label.setText("休息中")
+            return
+        if snooze_seconds:
+            self.next_rest_label.setText("免打扰")
             return
         minutes, seconds = divmod(self._next_rest_secs, 60)
         label = f"{minutes:02d}:{seconds:02d}"
@@ -3972,6 +4466,8 @@ class CareEyesApp(QWidget):
             return
         self._sync_work_clock()
         if self.overlay is not None or not self._work_clock.active:
+            return
+        if self._work_clock.snooze_remaining_seconds:
             return
         if self._work_clock.remaining_seconds > 0:
             return
@@ -3998,10 +4494,14 @@ class CareEyesApp(QWidget):
             self.overlay.raise_()
             return
         self._sync_work_clock()
+        self._work_clock.cancel_snooze()
         self.overlay = EyeExerciseOverlay(self.rest_duration_sec,
                                           force_mode=self.force_rest)
         self._restart_rest_schedule()
-        self.overlay.closed.connect(self._on_overlay_closed)
+        current_overlay = self.overlay
+        current_overlay.closed.connect(
+            lambda: self._on_overlay_closed(current_overlay)
+        )
         self.overlay.show()
         if self.sound_enabled:
             QApplication.beep()
@@ -4011,7 +4511,10 @@ class CareEyesApp(QWidget):
             self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
         self._pet_state()
 
-    def _on_overlay_closed(self):
+    def _on_overlay_closed(self, overlay=None):
+        overlay = self.overlay if overlay is None else overlay
+        if overlay is None or overlay is not self.overlay:
+            return
         self._sync_work_clock()
         self.overlay = None
         self._restart_rest_schedule(reset_session=True)
@@ -4019,22 +4522,30 @@ class CareEyesApp(QWidget):
             self.pet.set_countdown(self._next_rest_secs, self.rest_interval_min * 60)
         self._pet_state()
         self._refresh_countdown_label()
+        if overlay.completed and not self._quitting:
+            self._complete_pet_rest()
+        overlay.deleteLater()
 
     def _refresh_countdown(self):
         previous_minutes = self.today_minutes
         self._sync_work_clock()
-        if self._work_clock.active and self._next_rest_secs == 0:
+        if (self._work_clock.active and self._next_rest_secs == 0
+                and not self._work_clock.snooze_remaining_seconds):
             self._on_rest_trigger()
         self._refresh_countdown_label()
-        self._sync_pet_page()
         if self.today_minutes != previous_minutes:
             self._refresh_today_summary()
         if self.pet is not None:
             total = 5 * 60 if self._rest_deferred else self.rest_interval_min * 60
             self.pet.set_countdown(self._next_rest_secs, total)
-            self._pet_state()
+        self._pet_state(refresh_page=False)
+        preview = vars(self).get("pet_preview")
+        if (preview is not None and preview.isVisible()
+                and not preview.window().isMinimized()):
+            self._sync_pet_page()
         if (self._work_clock.active and 0 < self._next_rest_secs <= 60
-                and not self._warned_1min and not self._rest_deferred):
+                and not self._warned_1min and not self._rest_deferred
+                and not self._work_clock.snooze_remaining_seconds):
             self._warned_1min = True
             self.tray.showMessage(APP_TITLE,"还有 1 分钟就该休息了 ☕",
                                   QSystemTrayIcon.Information,5000)
@@ -4064,6 +4575,43 @@ class CareEyesApp(QWidget):
             d = today - timedelta(days=i)
             days.append(d.strftime("%m/%d")); vals.append(self.week_data.get(d.isoformat(),0))
         self.bar_chart.set_data(vals,days)
+
+    def _usage_history(self):
+        today = date.today()
+        cutoff = today - timedelta(days=31)
+        history = dict(self.week_data)
+        history[today.isoformat()] = self.today_minutes
+        return {
+            day: _bounded_int(minutes, 0, 0, 24 * 60)
+            for day, minutes in history.items()
+            if isinstance(day, str) and isinstance(minutes, (int, float))
+            and not isinstance(minutes, bool) and self._valid_stat_day(day, cutoff)
+        }
+
+    def _export_statistics(self):
+        filename = f"CareEyesPro-usage-{date.today().isoformat()}.csv"
+        path = QFileDialog.getSaveFileName(
+            self, "导出用眼统计", filename, "CSV 文件 (*.csv)"
+        )[0]
+        if not path:
+            return False
+        self._sync_work_clock()
+        history = self._usage_history()
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer)
+        writer.writerow(("date", "usage_minutes"))
+        writer.writerows(sorted(history.items()))
+        try:
+            _write_atomic(path, buffer.getvalue().encode("utf-8-sig"))
+        except OSError as error:
+            self.export_status_label.setText(f"导出失败：{error}")
+            self.export_status_label.setStyleSheet("color:#f85149;font-size:11px;")
+            self.export_status_label.setToolTip(path)
+            return False
+        self.export_status_label.setText(f"已导出 {len(history)} 天记录：{os.path.basename(path)}")
+        self.export_status_label.setStyleSheet("color:#10b981;font-size:11px;")
+        self.export_status_label.setToolTip(path)
+        return True
 
     def _refresh_system_metrics(self):
         """刷新统计页的系统状态；任何单项失败都只影响该项。"""
@@ -4268,8 +4816,9 @@ class CareEyesApp(QWidget):
 
         self._set_autostart(False)
         if self.overlay is not None:
-            self.overlay._can_close = True
-            self.overlay.close()
+            self.overlay.cancel()
+        self._pet_progress = PetProgress()
+        self._sync_pet_progress()
         self._dim_mgr.hide()
         self._next_rest_secs = self.rest_interval_min * 60
         self._warned_1min = False
@@ -4279,6 +4828,7 @@ class CareEyesApp(QWidget):
         self.break_count = 0
         self._stat_save_ticks = 0
         self.week_data = {}
+        self._work_clock.cancel_snooze()
         self._work_clock.restart(self.rest_interval_min * 60, reset_session=True)
         self.pet_pos = None                 # 桌宠回到右下角默认位置
         if self.pet is not None:
@@ -4325,6 +4875,7 @@ class CareEyesApp(QWidget):
         "week_data":{},
         "pet_enabled":True,"pet_kind":"blue_cat",
         "pet_interaction_mode":"move","pet_pos":[],
+        "pet_completed_rests":0,"pet_outfit":list(PetProgress.DEFAULT_OUTFIT),
     }
 
     def load_settings(self):
@@ -4357,6 +4908,10 @@ class CareEyesApp(QWidget):
             cfg["pet_interaction_mode"]
         )
         self.pet_pos=_parse_position(cfg["pet_pos"])
+        self._pet_progress = PetProgress(
+            _bounded_int(cfg["pet_completed_rests"], 0, 0, 1_000_000),
+            cfg["pet_outfit"],
+        )
         cutoff = date.today() - timedelta(days=31)
         week_data = cfg["week_data"] if isinstance(cfg["week_data"], dict) else {}
         self.week_data={str(k): _bounded_int(v, 0, 0, 24 * 60)
@@ -4390,20 +4945,11 @@ class CareEyesApp(QWidget):
         self.autostart=self._read_autostart()
 
     def _save_settings(self):
-        """原子写入：先写 .tmp 再 os.replace，防断电损坏。(#6)"""
+        """通过 QSaveFile 提交完整配置，失败时保留旧文件并报告状态。"""
         self._sync_work_clock()
         today=date.today().isoformat()
         self._rollover_stats_if_needed(today)
-        self.week_data[today]=self.today_minutes
-        cutoff = date.today() - timedelta(days=31)
-        self.week_data = {
-            str(day): _bounded_int(minutes, 0, 0, 24 * 60)
-            for day, minutes in self.week_data.items()
-            if isinstance(day, str)
-            and isinstance(minutes, (int, float))
-            and not isinstance(minutes, bool)
-            and self._valid_stat_day(day, cutoff)
-        }
+        self.week_data = self._usage_history()
         data={
             "temp":self.temp,"bright":self.bright,"is_enabled":self.is_enabled,
             "rest_interval":self.rest_interval_min,"rest_duration":self.rest_duration_sec,
@@ -4419,15 +4965,28 @@ class CareEyesApp(QWidget):
                 "pet_interaction_mode", DesktopPet.DEFAULT_INTERACTION_MODE
             ),
             "pet_pos":self.pet_pos or [],
+            "pet_completed_rests":self._pet_progress.completed_rests,
+            "pet_outfit":list(self._pet_progress.outfit),
         }
-        tmp = CONFIG_FILE + ".tmp"
         try:
-            with open(tmp,"w",encoding="utf-8") as f:
-                json.dump(data,f,ensure_ascii=False,indent=2)
-            os.replace(tmp, CONFIG_FILE)   # 原子替换
-        except Exception:
-            try: os.remove(tmp)
-            except Exception: pass
+            _write_atomic(CONFIG_FILE, json.dumps(
+                data, ensure_ascii=False, indent=2, allow_nan=False
+            ).encode("utf-8"))
+        except (OSError, TypeError, ValueError) as error:
+            self._settings_error = str(error)
+            self._refresh_settings_status()
+            return False
+        self._settings_error = ""
+        self._refresh_settings_status()
+        return True
+
+    def _refresh_settings_status(self):
+        label = vars(self).get("config_status_label")
+        if label is not None:
+            message = f"保存失败：{self._settings_error}" if self._settings_error else "设置已保存"
+            color = "#f85149" if self._settings_error else "#8b949e"
+            label.setText(message)
+            label.setStyleSheet(f"color:{color};font-size:11px;")
 
     @staticmethod
     def _valid_stat_day(value, cutoff):

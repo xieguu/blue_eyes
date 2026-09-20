@@ -2,6 +2,7 @@ import unittest
 import json
 import os
 import tempfile
+from unittest.mock import Mock, patch
 
 import mainpro
 
@@ -32,6 +33,65 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(mainpro._bounded_float(float("inf"), 0.5, 0, 1), 0.5)
         self.assertEqual(mainpro._parse_position([12.9, -4.2]), [12, -4])
         self.assertIsNone(mainpro._parse_position([float("nan"), 2]))
+
+
+class DisplayManagerTests(unittest.TestCase):
+    def setUp(self):
+        mainpro.DisplayManager._build_ramp.cache_clear()
+        self.addCleanup(mainpro.DisplayManager._build_ramp.cache_clear)
+
+    def test_cached_ramp_is_immutable_and_preserves_samples(self):
+        channels = (0.5, 1.0, 0.2)
+        ramp = mainpro.DisplayManager._build_ramp(*channels)
+        expected = tuple(
+            tuple(int(channel * (sample_index * 256))
+                  for sample_index in range(256))
+            for channel in channels
+        )
+        self.assertEqual(ramp, expected)
+        self.assertIs(ramp, mainpro.DisplayManager._build_ramp(*channels))
+        with self.assertRaises(TypeError):
+            ramp[0][0] = 1
+
+    def test_repeated_settings_reuse_ramp_but_still_write_displays(self):
+        controller = Mock(spec=mainpro.GammaController)
+        controller.apply.return_value = True
+        with patch.object(mainpro.DisplayManager, "_controller", controller):
+            self.assertTrue(mainpro.DisplayManager.apply(5000, 0.9))
+            self.assertTrue(mainpro.DisplayManager.apply(5000, 0.9))
+        self.assertEqual(controller.apply.call_count, 2)
+        self.assertIs(
+            controller.apply.call_args_list[0].args[0],
+            controller.apply.call_args_list[1].args[0],
+        )
+        cache = mainpro.DisplayManager._build_ramp.cache_info()
+        self.assertEqual((cache.hits, cache.misses), (1, 1))
+
+    def test_changed_settings_build_distinct_ramps(self):
+        controller = Mock(spec=mainpro.GammaController)
+        with patch.object(mainpro.DisplayManager, "_controller", controller):
+            mainpro.DisplayManager.apply(5000, 0.6)
+            mainpro.DisplayManager.apply(5000, 0.9)
+            mainpro.DisplayManager.apply(6000, 0.9)
+        ramps = [call.args[0] for call in controller.apply.call_args_list]
+        self.assertNotEqual(ramps[0], ramps[1])
+        self.assertNotEqual(ramps[1], ramps[2])
+        self.assertEqual(mainpro.DisplayManager._build_ramp.cache_info().misses, 3)
+
+    def test_failed_display_write_is_not_cached_as_success(self):
+        controller = Mock(spec=mainpro.GammaController)
+        controller.apply.side_effect = [False, True]
+        with patch.object(mainpro.DisplayManager, "_controller", controller):
+            self.assertFalse(mainpro.DisplayManager.apply(5000, 0.9))
+            self.assertTrue(mainpro.DisplayManager.apply(5000, 0.9))
+        self.assertEqual(controller.apply.call_count, 2)
+
+    def test_ramp_cache_is_bounded(self):
+        for sample_index in range(40):
+            mainpro.DisplayManager._build_ramp(sample_index / 40, 1.0, 1.0)
+        cache = mainpro.DisplayManager._build_ramp.cache_info()
+        self.assertEqual(cache.maxsize, 32)
+        self.assertEqual(cache.currsize, 32)
 
 
 class MetricsTests(unittest.TestCase):

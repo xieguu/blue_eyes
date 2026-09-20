@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 import os
@@ -21,6 +22,7 @@ class OffscreenUiTests(unittest.TestCase):
         cls.application.setQuitOnLastWindowClosed(False)
 
     def setUp(self):
+        self.real_init_tray = mainpro.CareEyesApp.init_tray
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         config_path = os.path.join(self.directory.name, "settings.json")
@@ -68,6 +70,431 @@ class OffscreenUiTests(unittest.TestCase):
         self.window.deleteLater()
         self.application.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def test_reminder_controls_and_tray_actions_share_snooze_state(self):
+        with patch("mainpro.QSystemTrayIcon"):
+            self.real_init_tray(self.window)
+        self.window.snooze_button.menu().actions()[0].trigger()
+        self.assertGreater(self.window._work_clock.snooze_remaining_seconds, 895)
+        self.assertEqual(self.window.next_rest_label.text(), "免打扰")
+        self.assertTrue(self.window.resume_reminders_button.isEnabled())
+        self.assertTrue(self.window.resume_reminders_action.isEnabled())
+        self.window.snooze_tray_menu.actions()[1].trigger()
+        self.assertGreater(self.window._work_clock.snooze_remaining_seconds, 1795)
+        self.window.resume_reminders_action.trigger()
+        self.assertEqual(self.window._work_clock.snooze_remaining_seconds, 0)
+        self.assertFalse(self.window.resume_reminders_button.isEnabled())
+        self.assertFalse(self.window.resume_reminders_action.isEnabled())
+
+    def test_manual_rest_cancels_snooze_and_disables_controls(self):
+        self.window._snooze_reminders(15)
+        self.window.show_rest_overlay()
+        self.assertEqual(self.window._work_clock.snooze_remaining_seconds, 0)
+        self.assertFalse(self.window.snooze_button.isEnabled())
+        self.assertFalse(self.window.resume_reminders_button.isEnabled())
+        self.window.overlay.close()
+        self.assertTrue(self.window.snooze_button.isEnabled())
+
+    def test_reset_clears_snooze_without_persisting_its_deadline(self):
+        self.window._snooze_reminders(15)
+        self.window._reset_settings()
+        self.assertEqual(self.window._work_clock.snooze_remaining_seconds, 0)
+        self.assertFalse(self.window.resume_reminders_button.isEnabled())
+        with open(self.config_path, "r", encoding="utf-8") as handle:
+            settings = json.load(handle)
+        self.assertFalse(any("snooze" in field for field in settings))
+
+    def test_csv_export_includes_current_day_and_sanitizes_history(self):
+        today = mainpro.date.today()
+        previous = (today - mainpro.timedelta(days=1)).isoformat()
+        oldest = (today - mainpro.timedelta(days=31)).isoformat()
+        self.window.week_data = {
+            previous: 37,
+            oldest: 99999,
+            (today - mainpro.timedelta(days=32)).isoformat(): 10,
+            (today + mainpro.timedelta(days=1)).isoformat(): 10,
+            (today - mainpro.timedelta(days=2)).isoformat(): True,
+            "=INVALID()": 42,
+            "not-a-date": 3,
+        }
+        self.window._today_seconds = 125.0
+        self.window.today_minutes = 2
+        path = os.path.join(self.directory.name, "usage.csv")
+        with patch("mainpro.QFileDialog.getSaveFileName", return_value=(path, "")):
+            self.assertTrue(self.window._export_statistics())
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(3), b"\xef\xbb\xbf")
+        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.reader(handle))
+        self.assertEqual(rows, [
+            ["date", "usage_minutes"],
+            [oldest, "1440"], [previous, "37"], [today.isoformat(), "2"],
+        ])
+        self.assertIn("已导出 3 天记录", self.window.export_status_label.text())
+
+    def test_cancelled_csv_export_does_not_write(self):
+        with patch("mainpro.QFileDialog.getSaveFileName", return_value=("", "")):
+            with patch("mainpro._write_atomic") as write:
+                self.assertFalse(self.window._export_statistics())
+        write.assert_not_called()
+
+    def test_failed_csv_export_preserves_existing_file_and_shows_error(self):
+        path = os.path.join(self.directory.name, "usage.csv")
+        with open(path, "wb") as handle:
+            handle.write(b"original export")
+        with patch("mainpro.QFileDialog.getSaveFileName", return_value=(path, "")):
+            with patch("mainpro._write_atomic", side_effect=OSError("disk full")):
+                self.assertFalse(self.window._export_statistics())
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"original export")
+        self.assertIn("disk full", self.window.export_status_label.text())
+
+    def test_failed_settings_save_is_visible_and_success_clears_error(self):
+        with open(self.config_path, "rb") as handle:
+            original = handle.read()
+        with patch("mainpro._write_atomic", side_effect=OSError("disk full")):
+            self.assertFalse(self.window._save_settings())
+        with open(self.config_path, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertEqual(self.window._settings_error, "disk full")
+        self.assertIn("保存失败", self.window.config_status_label.text())
+        self.assertTrue(self.window._save_settings())
+        self.assertEqual(self.window._settings_error, "")
+        self.assertEqual(self.window.config_status_label.text(), "设置已保存")
+
+    def test_nonfinite_settings_never_replace_valid_configuration(self):
+        with open(self.config_path, "rb") as handle:
+            original = handle.read()
+        self.window.bright = float("nan")
+        with patch("mainpro._write_atomic") as write:
+            self.assertFalse(self.window._save_settings())
+        write.assert_not_called()
+        with open(self.config_path, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        self.window.bright = 1.0
+
+    def test_gamma_guard_does_not_overwrite_active_transition(self):
+        self.window.apply_preset("睡眠")
+        with patch("mainpro.DisplayManager.apply") as apply:
+            self.window._guard_apply()
+            apply.assert_not_called()
+            self.window._transition.stop()
+            self.window._guard_apply()
+            apply.assert_called_once_with(2500, 0.55)
+
+    def test_hidden_window_keeps_required_timers_only(self):
+        self.assertFalse(self.window.pet._anim_timer.isActive())
+        self.assertFalse(self.window.pet._chat_timer.isActive())
+        self.assertFalse(self.window.pet_preview._preview_timer.isActive())
+        self.assertFalse(self.window.metrics_timer.isActive())
+        self.window._nav(2)
+        self.assertFalse(self.window.metrics_timer.isActive())
+        self.window._nav(3)
+        self.assertFalse(self.window.pet_preview._preview_timer.isActive())
+        self.window._refresh_countdown()
+        self.assertTrue(self.window.guard_timer.isActive())
+        self.assertTrue(self.window.countdown_timer.isActive())
+        self.assertTrue(self.window._work_clock.active)
+
+    def test_pet_timers_follow_visibility_and_clear_messages(self):
+        pet = self.window.pet
+        self.window._on_pet_toggle(True)
+        self.assertTrue(pet._anim_timer.isActive())
+        self.assertTrue(pet._chat_timer.isActive())
+        pet.say("take a break")
+        self.assertTrue(pet._msg_timer.isActive())
+        self.window._on_pet_toggle(False)
+        self.assertFalse(pet._anim_timer.isActive())
+        self.assertFalse(pet._chat_timer.isActive())
+        self.assertFalse(pet._msg_timer.isActive())
+        self.assertEqual(pet._msg, "")
+        self.window._on_pet_toggle(True)
+        self.assertTrue(pet._anim_timer.isActive())
+        self.assertTrue(pet._chat_timer.isActive())
+
+    def test_hidden_pet_messages_wait_until_shown(self):
+        pet = self.window.pet
+        pet.say("take a break", 500)
+        self.assertFalse(pet._msg_timer.isActive())
+        self.window._on_pet_toggle(True)
+        self.assertTrue(pet._msg_timer.isActive())
+        self.assertEqual(pet._msg_timer.interval(), 500)
+
+    def test_preview_timer_follows_navigation_and_window_visibility(self):
+        timer = self.window.pet_preview._preview_timer
+        self.window.show()
+        self.assertFalse(timer.isActive())
+        self.window._nav(3)
+        self.assertTrue(timer.isActive())
+        for preview in self.window.findChildren(mainpro.PetPreview):
+            if preview is not self.window.pet_preview:
+                self.assertFalse(preview._preview_timer.isActive())
+        self.window._nav(0)
+        self.assertFalse(timer.isActive())
+        self.window._nav(3)
+        self.assertTrue(timer.isActive())
+        self.window.hide()
+        self.assertFalse(timer.isActive())
+        self.window.show()
+        self.assertTrue(timer.isActive())
+
+    def test_minimized_window_suspends_visual_timers(self):
+        for page_index, timer in (
+            (2, self.window.metrics_timer),
+            (3, self.window.pet_preview._preview_timer),
+        ):
+            with self.subTest(page=page_index):
+                self.window.showNormal()
+                self.window._nav(page_index)
+                self.application.processEvents()
+                self.assertTrue(timer.isActive())
+                self.window.showMinimized()
+                self.application.processEvents()
+                self.assertFalse(timer.isActive())
+                self.assertTrue(self.window.countdown_timer.isActive())
+                self.window.showNormal()
+                self.application.processEvents()
+                self.assertTrue(timer.isActive())
+
+    def test_metrics_sampling_is_lazy_and_resets_on_resume(self):
+        refresh = self.window._refresh_system_metrics
+        refresh.assert_not_called()
+        with patch.object(self.window._metrics, "reset_cpu_baseline") as reset:
+            self.window.show()
+            refresh.assert_not_called()
+            self.window._nav(2)
+            refresh.assert_called_once()
+            self.assertTrue(self.window.metrics_timer.isActive())
+            self.window._sync_metrics_timer()
+            refresh.assert_called_once()
+            self.window.hide()
+            self.assertFalse(self.window.metrics_timer.isActive())
+            self.window.show()
+            self.assertEqual(refresh.call_count, 2)
+            self.window._nav(0)
+            self.assertFalse(self.window.metrics_timer.isActive())
+            self.window._nav(2)
+            self.assertEqual(refresh.call_count, 3)
+            self.assertEqual(reset.call_count, 3)
+
+    def test_countdown_refreshes_pet_page_only_when_visible_and_once(self):
+        with patch.object(self.window, "_sync_pet_page") as refresh:
+            self.window._refresh_countdown()
+            refresh.assert_not_called()
+            self.window.show()
+            self.window._nav(3)
+            refresh.reset_mock()
+            self.window._refresh_countdown()
+            refresh.assert_called_once()
+            self.window.hide()
+            refresh.reset_mock()
+            self.window._refresh_countdown()
+            refresh.assert_not_called()
+
+    def test_cleanup_stops_previews_and_pet_timers(self):
+        self.window.show()
+        self.window._nav(3)
+        self.window._on_pet_toggle(True)
+        self.window.pet.say("take a break")
+        self.window._cleanup()
+        for timer in (
+            self.window.pet_preview._preview_timer,
+            self.window.pet._anim_timer,
+            self.window.pet._chat_timer,
+            self.window.pet._msg_timer,
+            self.window.guard_timer,
+            self.window.countdown_timer,
+            self.window.metrics_timer,
+        ):
+            self.assertFalse(timer.isActive())
+
+    def test_unchanged_preview_state_does_not_repaint(self):
+        preview = self.window.pet_preview
+        with patch.object(preview, "update") as update:
+            preview.set_state("idle")
+            update.assert_not_called()
+            preview.set_state("tired")
+            update.assert_called_once()
+            preview.set_state("invalid")
+            update.assert_called_once()
+
+    def test_starter_outfit_and_locked_rewards_are_visible(self):
+        self.assertEqual(self.window.pet_level_label.text(), "Lv. 1")
+        self.assertEqual(self.window.pet_reward_count.text(), "0 / 6")
+        self.assertEqual(self.window.pet_experience_progress.maximum(), 20)
+        for decoration in ("scarf", "sprout"):
+            self.assertTrue(self.window.pet_outfit_buttons[decoration].isEnabled())
+            self.assertTrue(self.window.pet_outfit_buttons[decoration].isChecked())
+        for decoration in ("star_pin", "night_cap"):
+            self.assertFalse(self.window.pet_outfit_buttons[decoration].isEnabled())
+            self.window._toggle_pet_decoration(decoration)
+        self.assertEqual(self.window.pet._outfit, ("scarf", "sprout"))
+        self.assertEqual(self.window.pet_preview._outfit, self.window.pet._outfit)
+
+    def test_outfit_toggles_update_all_previews_and_save_empty_selection(self):
+        self.window.pet_outfit_buttons["scarf"].click()
+        self.assertEqual(self.window.pet._outfit, ("sprout",))
+        self.assertEqual(self.window.pet_preview._outfit, ("sprout",))
+        for button in self.window.pet_skin_buttons.values():
+            self.assertEqual(button.preview._outfit, ("sprout",))
+        self.window.pet_outfit_buttons["sprout"].click()
+        self.assertEqual(self.window._pet_progress.outfit, ())
+        with open(self.config_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["pet_outfit"], [])
+        restored = mainpro.CareEyesApp.__new__(mainpro.CareEyesApp)
+        restored.load_settings()
+        self.assertEqual(restored._pet_progress.outfit, ())
+
+    def test_level_three_matches_reference_and_star_unlock_updates_cards(self):
+        self.window._pet_progress = mainpro.PetProgress(4)
+        self.window._sync_pet_progress()
+        self.assertEqual(self.window.pet_level_label.text(), "Lv. 3")
+        self.assertEqual(self.window.pet_reward_count.text(), "4 / 6")
+        self.assertIn("2", self.window.pet_reward_remaining.text())
+        self.window._pet_progress = mainpro.PetProgress(6)
+        self.window._sync_pet_progress()
+        self.window.pet_outfit_buttons["star_pin"].click()
+        self.assertEqual(self.window.pet._outfit, ("scarf", "sprout", "star_pin"))
+        self.assertEqual(self.window.pet_reward_count.text(), "6 / 12")
+        self.assertFalse(self.window.pet_outfit_buttons["night_cap"].isEnabled())
+
+    def test_headwear_replaces_sprout_and_remains_equipped_when_skin_changes(self):
+        self.window._pet_progress = mainpro.PetProgress(12, ["scarf", "sprout", "star_pin"])
+        self.window._sync_pet_progress()
+        self.window.pet_outfit_buttons["night_cap"].click()
+        outfit = ("scarf", "star_pin", "night_cap")
+        self.assertEqual(self.window.pet._outfit, outfit)
+        self.assertFalse(self.window.pet_outfit_buttons["sprout"].isChecked())
+        self.window.pet_skin_buttons["pixel_robot"].click()
+        self.assertEqual(self.window.pet_preview._outfit, outfit)
+        self.assertEqual(self.window._pet_progress.level, 7)
+        self.assertEqual(self.window.pet_reward_title.text(), "衣柜已集齐")
+        with open(self.config_path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["pet_outfit"], list(outfit))
+        self.assertEqual(saved["pet_completed_rests"], 12)
+
+    def test_completed_rest_awards_once_unlocks_and_persists(self):
+        self.window._pet_progress = mainpro.PetProgress(5)
+        self.window._sync_pet_progress()
+        self.window.show_rest_overlay()
+        overlay = self.window.overlay
+        overlay._deadline = mainpro.time.monotonic() - 1
+        overlay._tick()
+        self.assertTrue(overlay.completed)
+        self.assertIsNone(self.window.overlay)
+        self.assertEqual(self.window._pet_progress.completed_rests, 6)
+        self.assertEqual(self.window.pet_level_label.text(), "Lv. 4")
+        self.assertTrue(self.window.pet_outfit_buttons["star_pin"].isEnabled())
+        self.assertFalse(self.window.pet_outfit_buttons["star_pin"].isChecked())
+        self.window._on_overlay_closed(overlay)
+        self.assertEqual(self.window._pet_progress.completed_rests, 6)
+        with open(self.config_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["pet_completed_rests"], 6)
+
+    def test_skipping_rest_does_not_award_growth(self):
+        self.window.show_rest_overlay()
+        overlay = self.window.overlay
+        overlay._close()
+        self.assertFalse(overlay.completed)
+        self.assertEqual(self.window._pet_progress.completed_rests, 0)
+        self.assertEqual(self.window.pet_experience_progress.value(), 0)
+
+    def test_forced_rest_can_be_skipped_after_lock_without_awarding_growth(self):
+        self.window.force_rest = True
+        self.window.show_rest_overlay()
+        overlay = self.window.overlay
+        overlay._close()
+        self.assertIs(self.window.overlay, overlay)
+        overlay._unlock_deadline = mainpro.time.monotonic() - 1
+        overlay._close()
+        self.assertIsNone(self.window.overlay)
+        self.assertFalse(overlay.completed)
+        self.assertEqual(self.window._pet_progress.completed_rests, 0)
+
+    def test_old_overlay_callback_cannot_close_or_reward_new_rest(self):
+        self.window.show_rest_overlay()
+        previous_overlay = self.window.overlay
+        previous_overlay._close()
+        self.window.show_rest_overlay()
+        current_overlay = self.window.overlay
+        self.window._on_overlay_closed(previous_overlay)
+        self.assertIs(self.window.overlay, current_overlay)
+        self.assertEqual(self.window._pet_progress.completed_rests, 0)
+        current_overlay._deadline = mainpro.time.monotonic() - 1
+        current_overlay._tick()
+        self.assertEqual(self.window._pet_progress.completed_rests, 1)
+
+    def test_reset_cancels_pending_completion_and_clears_growth(self):
+        self.window._pet_progress = mainpro.PetProgress(12, ["night_cap"])
+        self.window.show_rest_overlay()
+        overlay = self.window.overlay
+        overlay._deadline = mainpro.time.monotonic() - 1
+        self.window._reset_settings()
+        self.assertFalse(overlay.completed)
+        self.assertEqual(self.window._pet_progress.completed_rests, 0)
+        self.assertEqual(self.window.pet._outfit, ("scarf", "sprout"))
+        self.assertFalse(self.window.pet_outfit_buttons["star_pin"].isEnabled())
+
+    def test_shutdown_cancels_pending_completion_without_awarding_growth(self):
+        self.window._pet_progress = mainpro.PetProgress(5)
+        self.window.show_rest_overlay()
+        overlay = self.window.overlay
+        overlay._deadline = mainpro.time.monotonic() - 1
+        self.window._cleanup()
+        self.assertFalse(overlay.completed)
+        self.assertEqual(self.window._pet_progress.completed_rests, 5)
+        with open(self.config_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["pet_completed_rests"], 5)
+
+    def test_old_settings_do_not_turn_started_breaks_into_growth(self):
+        with open(self.config_path, encoding="utf-8") as handle:
+            settings = json.load(handle)
+        settings.pop("pet_completed_rests")
+        settings.pop("pet_outfit")
+        settings["break_count"] = 100
+        with open(self.config_path, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle)
+        restored = mainpro.CareEyesApp.__new__(mainpro.CareEyesApp)
+        restored.load_settings()
+        self.assertEqual(restored._pet_progress.completed_rests, 0)
+        self.assertEqual(restored._pet_progress.outfit, ("scarf", "sprout"))
+
+    def test_progress_settings_are_sanitized_before_rendering(self):
+        for count, outfit, expected_count, expected_outfit in (
+            (-4, ["scarf", "night_cap", {}], 0, ("scarf",)),
+            (True, ["sprout"], 0, ("sprout",)),
+            (6, ["night_cap", "star_pin", "star_pin"], 6, ("star_pin",)),
+            ("12", "night_cap", 0, ("scarf", "sprout")),
+        ):
+            with self.subTest(count=count, outfit=outfit):
+                with open(self.config_path, "w", encoding="utf-8") as handle:
+                    json.dump({"pet_completed_rests": count, "pet_outfit": outfit}, handle)
+                restored = mainpro.CareEyesApp.__new__(mainpro.CareEyesApp)
+                restored.load_settings()
+                self.assertEqual(restored._pet_progress.completed_rests, expected_count)
+                self.assertEqual(restored._pet_progress.outfit, expected_outfit)
+
+    def test_daily_rollover_preserves_lifetime_growth_and_outfit(self):
+        self.window._pet_progress = mainpro.PetProgress(6, ["scarf", "star_pin"])
+        self.window._stat_date = (mainpro.date.today() - mainpro.timedelta(days=1)).isoformat()
+        self.window._rollover_stats_if_needed()
+        self.assertEqual(self.window._pet_progress.completed_rests, 6)
+        self.assertEqual(self.window._pet_progress.outfit, ("scarf", "star_pin"))
+
+    def test_compact_studio_keeps_cards_inside_viewport_and_expands_controls(self):
+        self.window.resize(760, 560)
+        self.window.show()
+        self.window._nav(3)
+        self.application.processEvents()
+        self.assertEqual(self.window.pet_page_body.width(), self.window.pet_scroll.viewport().width())
+        self.assertFalse(self.window.pet_more_skins.isVisible())
+        self.window.pet_more_button.click()
+        self.assertTrue(self.window.pet_more_skins.isVisible())
+        self.window.pet_play_toggle.click()
+        self.assertTrue(self.window.pet_play_panel.isVisible())
+        self.application.processEvents()
+        self.assertEqual(self.window.pet_page_body.width(), self.window.pet_scroll.viewport().width())
 
     def test_construct_pause_toggle_and_resume(self):
         self.assertTrue(self.window._work_clock.active)
@@ -223,7 +650,7 @@ class PetArtworkTests(unittest.TestCase):
                 blink=0, look=(0.0, 0.0), surprise=None):
         self.preview._pet_kind = pet_kind
         self.preview._state = state
-        self.preview._decoration = decoration
+        self.preview.set_outfit((decoration,) if isinstance(decoration, str) else decoration)
         self.preview._phase = .35
         self.preview._blink = blink
         self.preview._look = look
@@ -241,12 +668,10 @@ class PetArtworkTests(unittest.TestCase):
             painter.end()
         return image
 
-    def test_all_skins_states_and_unlocked_decorations_fit_the_canvas(self):
+    def test_all_skins_states_and_decorations_fit_the_canvas(self):
         for pet_kind, style in mainpro.DesktopPet.PET_STYLES.items():
             for state in style["palette"]:
-                for decoration, info in mainpro.DesktopPet.DECORATIONS.items():
-                    if not info["unlocked"]:
-                        continue
+                for decoration in mainpro.DesktopPet.DECORATIONS:
                     with self.subTest(pet_kind=pet_kind, state=state, decoration=decoration):
                         image = self._render(pet_kind, state, decoration)
                         alpha = self._image_bytes(image)[3::4]
@@ -315,7 +740,9 @@ class PetArtworkTests(unittest.TestCase):
 
     def test_robot_accessories_do_not_cover_the_pixel_heart(self):
         baseline = round(mainpro.DesktopPet.BODY_TOP + math.sin(.35) * 3 - 5)
-        for decoration in ("scarf", "sprout"):
+        for decoration in ("scarf", "sprout", "star_pin", "night_cap",
+                           ("scarf", "sprout", "star_pin"),
+                           ("scarf", "star_pin", "night_cap")):
             with self.subTest(decoration=decoration):
                 image = self._render("pixel_robot", decoration=decoration)
                 heart_pixels = sum(
@@ -324,6 +751,19 @@ class PetArtworkTests(unittest.TestCase):
                     for pixel_y in range(baseline + 79, baseline + 94)
                 )
                 self.assertEqual(heart_pixels, 144)
+
+    def test_layered_outfits_fit_every_skin_and_care_state(self):
+        for pet_kind, style in mainpro.DesktopPet.PET_STYLES.items():
+            for state in style["palette"]:
+                for outfit in ((), ("scarf", "sprout", "star_pin"),
+                               ("scarf", "star_pin", "night_cap")):
+                    with self.subTest(pet_kind=pet_kind, state=state, outfit=outfit):
+                        image = self._render(pet_kind, state, decoration=outfit)
+                        alpha = self._image_bytes(image)[3::4]
+                        width = image.width()
+                        border = alpha[:width] + alpha[-width:] + alpha[::width] + alpha[width - 1::width]
+                        self.assertFalse(any(border))
+                        self.assertGreater(sum(value > 0 for value in alpha), 3500)
 
     def test_thumbnail_and_high_dpi_rendering(self):
         for pet_kind in mainpro.DesktopPet.PET_STYLES:

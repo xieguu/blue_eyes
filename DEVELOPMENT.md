@@ -1,6 +1,6 @@
 # CareEyes Pro 开发规范
 
-本文档是 CareEyes Pro 的本地开发规范，仅适用于本仓库，不与任何远端仓库（GitHub/GitLab 等）关联。所有开发、测试、打包流程以本地 git 仓库为准。
+本文档是 CareEyes Pro 的开发规范，适用于本仓库。开发、测试和打包在本地工作区完成；仅在用户明确要求时提交并推送到已确认的 GitHub 远端。
 
 ## 1. 项目定位与运行环境
 
@@ -12,7 +12,7 @@
 ## 2. 代码组织
 
 - 两层结构，保持现有边界：
-  - `careeyes_runtime.py`：纯 Windows API 封装与可测试的运行时逻辑（Gamma、单实例、活动检测、计时），不 import PyQt。
+  - `careeyes_runtime.py`：纯 Windows API 封装与可测试的运行时逻辑（Gamma、单实例、活动检测、计时、桌宠成长及装备槽），不 import PyQt。
   - `mainpro.py`：UI、业务编排、配置读写。业务规则尽量下沉到 runtime，便于单元测试。
 - 命名：
   - 模块/类：`PascalCase`；函数/变量：`snake_case`；常量：`UPPER_SNAKE_CASE`。
@@ -28,9 +28,16 @@
   - runtime 层：API 失败抛 `OSError`，由调用方决定降级策略；
   - UI 层：非致命错误静默降级（显示“不可用”），不弹框、不崩进程；
   - 单实例失败、Gamma 写入失败等必须记录到对应 `errors` 字典。
-- 配置持久化：始终“先写临时文件再原子替换”，不直接覆盖 `~/.care_eyes_pro.json`。
-- 定时任务（QTimer）统一 1s 粒度；空闲检测阈值常量（`IDLE_PAUSE_SECONDS` 等）集中在 `mainpro.py` 顶部。
+- 配置持久化和 CSV 导出复用 `_write_atomic` / `QSaveFile`，明确关闭直接覆盖回退；检查打开、完整写入和提交结果，失败不得静默报告成功。
+- 配置保存失败由 `_settings_error` 记录并呈现在设置页；序列化禁用 NaN / Infinity，失败保留原配置。
+- 业务倒计时（QTimer）保持 1s 粒度；动画与护眼守护保留独立频率。桌宠隐藏时停止其动画，主窗口隐藏或最小化时停止页面预览和系统采样；退出时显式停止定时器。空闲检测阈值常量（`IDLE_PAUSE_SECONDS` 等）集中在 `mainpro.py` 顶部。
+- 高频纯计算优先使用标准库的有界缓存，缓存值必须不可变；Gamma 缓存仅复用曲线计算结果，不缓存驱动写入结果，也不跳过原始曲线的记录与恢复。
+- 色温渐变使用 Qt `QTimeLine` 与 OutCubic 曲线，保持 50ms 更新间隔；连续切换从最近成功应用的帧开始，停止后不接受迟到帧，不按回调次数累计进度。
+- 免打扰截止时间属于 `WorkClock` 的单调时钟状态，只抑制自动提醒和预告，不停止活动统计、不增加定时器、不写入配置。手动休息和重置设置时取消。
+- CSV 仅导出保留范围内的每日用眼分钟数，采用标准库 `csv` 和 UTF-8 BOM；不补造缺失日期，不把历史休息启动次数转成完成次数。
 - 全屏进程名判断走 `FULLSCREEN_WHITELIST` / `FULLSCREEN_FORCE_DEFER` 两个集合，新增例外直接改集合，不写散落的 `if`。
+- 桌宠成长以 `PetProgress.completed_rests` 为唯一事实来源，等级与解锁由模型推导；服装的穿戴权限由模型控制，不在 renderer 内硬编码锁定状态。
+- 休息遮罩只在达到截止时间且未取消时标记完成；结算必须校验当前遮罩身份。跳过、重置和退出不得发放成长奖励。
 
 ## 4. 测试规范
 
@@ -41,7 +48,14 @@
   - 单实例互斥与激活消息（`SingleInstance`）；
   - 休息调度 / 全屏顺延（`WorkClock`、调度函数）；
   - 配置净化与启动清理；
-  - UI 冒烟（`test_ui_smoke.py`）。
+  - UI 冒烟（`test_ui_smoke.py`）；
+  - Gamma 缓存边界、重复写入与失败重试；
+  - 桌宠/预览/系统采样的显示、隐藏、最小化、恢复和退出生命周期。
+  - 等级与解锁阈值、组合穿戴和头饰互斥（`test_pet_progress.py`）；
+  - 完整休息一次结算、跳过/取消不发奖、旧配置迁移、跨日成长保留与组合服装绘制边界。
+  - 免打扰到期、提前恢复、空闲期间到期、统计连续性，以及页面/托盘状态同步。
+  - CSV 排序、保留窗口、非法记录过滤、取消/失败不覆盖文件；设置保存错误可见且成功后恢复。
+  - Qt 渐变延迟追赶、连续切换、失败帧不成为衔接起点，以及停止后的迟到回调。
 - 运行：
   ```powershell
   python -m unittest discover -s tests -v
@@ -51,6 +65,7 @@
 ## 5. 构建与发布
 
 - 打包：PyInstaller，入口 `build.ps1`，配置 `CareEyesPro.spec`。
+- `build.ps1` 保留 UTF-8 BOM，确保 Windows PowerShell 5.1 正确解析中文字符串及变量插值。
   ```powershell
   pip install pyinstaller
   powershell -ExecutionPolicy Bypass -File .\build.ps1
@@ -60,10 +75,10 @@
 
 ## 6. Git 提交规范
 
-- 本地仓库（`.git`）为唯一事实来源，不配置任何 remote，不推送。
+- 提交和推送须由用户明确要求；推送前确认远端、账号、目标分支及远端进度，不强推、不覆盖远端历史。
 - 提交信息格式：`<type>: <简述>`，type 限 `feat` / `fix` / `chore` / `docs` / `test` / `refactor`。
 - 粒度：一个可独立验证的改动一次提交；UI + runtime 解耦时分别提交。
-- 提交前检查：`git status` 确认未把 `__pycache__/`、`build/`、`dist/`、`tmp/` 带入（见 `.gitignore`，`tmp/` 需手动保持不跟踪）。
+- 提交前检查：`git status` 确认未把 `__pycache__/`、`build/`、`dist/`、`tmp/` 带入；这些目录均由 `.gitignore` 排除。
 - 大文件（exe、图片）不入库；截图仅保留 `docs/images/` 下被 README 引用的部分。
 
 ## 7. 目录约定

@@ -264,17 +264,115 @@ class WindowsActivityMonitor:
             self._window_handle = None
 
 
+class PetProgress:
+    EXPERIENCE_PER_REST = 10
+    RESTS_PER_LEVEL = 2
+    DEFAULT_OUTFIT = ("scarf", "sprout")
+    OUTFIT_RULES = {
+        "scarf": {"slot": "neck", "rests": 0},
+        "sprout": {"slot": "head", "rests": 0},
+        "star_pin": {"slot": "pin", "rests": 6},
+        "night_cap": {"slot": "head", "rests": 12},
+    }
+
+    def __init__(self, completed_rests=0, outfit=None):
+        if type(completed_rests) is not int or completed_rests < 0:
+            raise ValueError("completed_rests must be a nonnegative integer")
+        self.completed_rests = completed_rests
+        selected = self.DEFAULT_OUTFIT if outfit is None else outfit
+        if not isinstance(selected, (list, tuple)):
+            raise ValueError("outfit must be a list or tuple")
+        slots = {}
+        for decoration in selected:
+            if self.is_unlocked(decoration):
+                slots[self.OUTFIT_RULES[decoration]["slot"]] = decoration
+        self._outfit = tuple(
+            decoration for decoration, rule in self.OUTFIT_RULES.items()
+            if slots.get(rule["slot"]) == decoration
+        )
+
+    @property
+    def outfit(self):
+        return self._outfit
+
+    @property
+    def level(self):
+        return 1 + self.completed_rests // self.RESTS_PER_LEVEL
+
+    @property
+    def experience(self):
+        return self.completed_rests * self.EXPERIENCE_PER_REST
+
+    @property
+    def level_experience(self):
+        return self.completed_rests % self.RESTS_PER_LEVEL * self.EXPERIENCE_PER_REST
+
+    @property
+    def experience_per_level(self):
+        return self.RESTS_PER_LEVEL * self.EXPERIENCE_PER_REST
+
+    @property
+    def next_unlock(self):
+        return next(
+            ((decoration, rule["rests"])
+             for decoration, rule in self.OUTFIT_RULES.items()
+             if self.completed_rests < rule["rests"]),
+            None,
+        )
+
+    def is_unlocked(self, decoration):
+        return (isinstance(decoration, str) and decoration in self.OUTFIT_RULES
+                and self.completed_rests >= self.OUTFIT_RULES[decoration]["rests"])
+
+    def toggle_decoration(self, decoration):
+        if not self.is_unlocked(decoration):
+            return False
+        if decoration in self._outfit:
+            self._outfit = tuple(item for item in self._outfit if item != decoration)
+        else:
+            slot = self.OUTFIT_RULES[decoration]["slot"]
+            selected = {item for item in self._outfit
+                        if self.OUTFIT_RULES[item]["slot"] != slot}
+            selected.add(decoration)
+            self._outfit = tuple(item for item in self.OUTFIT_RULES if item in selected)
+        return True
+
+    def complete_rest(self):
+        self.completed_rests += 1
+        return tuple(
+            decoration for decoration, rule in self.OUTFIT_RULES.items()
+            if rule["rests"] == self.completed_rests
+        )
+
+
 class WorkClock:
     def __init__(self, duration_seconds, clock=None):
         self._clock = clock if clock is not None else time.monotonic
         self._last_sample = self._clock()
         self._remaining = max(0.0, float(duration_seconds))
+        self._snooze_deadline = None
         self.active = False
         self.session_seconds = 0.0
 
     @property
     def remaining_seconds(self):
         return math.ceil(self._remaining)
+
+    @property
+    def snooze_remaining_seconds(self):
+        if self._snooze_deadline is None:
+            return 0
+        return max(0, math.ceil(self._snooze_deadline - self._clock()))
+
+    def snooze(self, duration_seconds):
+        if (isinstance(duration_seconds, bool)
+                or not isinstance(duration_seconds, (int, float))
+                or not math.isfinite(duration_seconds) or duration_seconds <= 0):
+            raise ValueError("snooze duration must be a positive finite number")
+        self._snooze_deadline = self._clock() + duration_seconds
+
+    def cancel_snooze(self):
+        self._snooze_deadline = None
 
     def sample(self, active, inactive_seconds=0.0):
         now = self._clock()
