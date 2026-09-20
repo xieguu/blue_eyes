@@ -23,15 +23,17 @@ def draw_text(painter, rectangle, content, size, color, bold=False):
     painter.drawText(rectangle, Qt.AlignCenter, content)
 
 
-def render_gallery(output, states=False):
+def render_gallery(output, states=False, kinds=None, outfit=None):
+    kinds = list(DesktopPet.PET_STYLES) if kinds is None else list(kinds)
+    if not kinds or any(kind not in DesktopPet.PET_STYLES for kind in kinds):
+        raise ValueError("Select at least one registered pet skin")
     application = QApplication.instance() or QApplication([])
     font_path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc"
     if font_path.exists():
         QFontDatabase.addApplicationFont(str(font_path))
     state_labels = {"idle": "陪伴", "tired": "疲劳", "resting": "休息", "off": "关闭"}
-    kinds = list(DesktopPet.PET_STYLES)
     items = [(kind, state) for state in (state_labels if states else ("idle",)) for kind in kinds]
-    columns = len(kinds) if states else 3
+    columns = len(kinds) if states else min(3, len(kinds))
     rows = (len(items) + columns - 1) // columns
     card_width, card_height = (156, 204) if states else (360, 290)
     margin, gap, header = 24, 16, 104
@@ -43,7 +45,7 @@ def render_gallery(output, states=False):
     painter.setRenderHint(QPainter.Antialiasing)
     draw_text(painter, QRectF(24, 20, width - 48, 36), "给休息，找个小搭子。", 27, "#e8f1f7", True)
     draw_text(painter, QRectF(24, 60, width - 48, 24),
-              "CareEyes Pro  /  九款桌宠 · 原生 QPainter 实时绘制", 13, "#8fa5b8")
+              f"CareEyes Pro  /  {len(kinds)} 款桌宠 · 原生 QPainter 实时绘制", 13, "#8fa5b8")
     for index, (kind, state) in enumerate(items):
         left = margin + (index % columns) * (card_width + gap)
         top = header + (index // columns) * (card_height + gap)
@@ -51,6 +53,8 @@ def render_gallery(output, states=False):
         painter.setBrush(QColor("#172838"))
         painter.drawRoundedRect(QRectF(left, top, card_width, card_height), 16, 16)
         preview = PetPreview(kind, animated=False, halo=False)
+        if outfit is not None:
+            preview.set_outfit(outfit)
         preview._state = state
         preview._phase = .35
         scale = 1.0 if states else 1.32
@@ -80,5 +84,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Render the actual desktop pet artwork without changing display settings.")
     parser.add_argument("--output", type=Path, default=Path("tmp/pet-gallery.png"))
     parser.add_argument("--states", action="store_true")
+    parser.add_argument("--kinds", nargs="+", choices=tuple(DesktopPet.PET_STYLES))
+    parser.add_argument("--outfit", nargs="*", choices=tuple(DesktopPet.DECORATIONS))
     arguments = parser.parse_args()
-    render_gallery(arguments.output, arguments.states)
+    render_gallery(arguments.output, arguments.states, arguments.kinds, arguments.outfit)

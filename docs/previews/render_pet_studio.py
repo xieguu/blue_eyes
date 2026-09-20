@@ -18,7 +18,10 @@ from PyQt5.QtWidgets import QApplication
 import mainpro
 
 
-def render_studio(output, completed_rests=4, outfit=None, width=1120, height=760):
+def render_studio(output, completed_rests=4, outfit=None, width=1120, height=760,
+                  pet_kind="seagull", show_more=False):
+    if pet_kind not in mainpro.DesktopPet.PET_STYLES:
+        raise ValueError(f"Unknown pet skin: {pet_kind}")
     progress = mainpro.PetProgress(completed_rests, outfit)
     application = QApplication.instance() or QApplication([])
     application.setQuitOnLastWindowClosed(False)
@@ -34,7 +37,7 @@ def render_studio(output, completed_rests=4, outfit=None, width=1120, height=760
         config_path = str(Path(directory) / "preview-settings.json")
         settings = dict(mainpro.CareEyesApp._DEFAULTS)
         settings.update({
-            "pet_enabled": True, "pet_kind": "seagull", "sound_enabled": False,
+            "pet_enabled": True, "pet_kind": pet_kind, "sound_enabled": False,
             "pet_completed_rests": progress.completed_rests,
             "pet_outfit": list(progress.outfit),
         })
@@ -56,6 +59,7 @@ def render_studio(output, completed_rests=4, outfit=None, width=1120, height=760
         try:
             window.resize(width, height)
             window._nav(3)
+            window.pet_more_button.setChecked(show_more)
             window._work_clock.restart(18 * 60 + 42)
             window.show()
             application.processEvents()
@@ -80,9 +84,11 @@ def main():
     parser.add_argument("--outfit", nargs="*", choices=tuple(mainpro.DesktopPet.DECORATIONS))
     parser.add_argument("--width", type=int, default=1120)
     parser.add_argument("--height", type=int, default=760)
+    parser.add_argument("--pet-kind", choices=tuple(mainpro.DesktopPet.PET_STYLES), default="seagull")
+    parser.add_argument("--more-skins", action="store_true")
     arguments = parser.parse_args()
     print(render_studio(arguments.output, arguments.rests, arguments.outfit,
-                        arguments.width, arguments.height))
+                        arguments.width, arguments.height, arguments.pet_kind, arguments.more_skins))
 
 
 if __name__ == "__main__":

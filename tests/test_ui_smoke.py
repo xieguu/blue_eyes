@@ -586,6 +586,69 @@ class OffscreenUiTests(unittest.TestCase):
             pet.deleteLater()
         self.application.processEvents()
 
+    def test_new_skins_switch_save_and_restore_without_resetting_progress(self):
+        outfit = ("scarf", "star_pin", "night_cap")
+        self.window._pet_progress = mainpro.PetProgress(12, outfit)
+        self.window._sync_pet_progress()
+        self.window._set_pet_interaction_mode("stretch")
+        self.window._work_clock.restart(937)
+        with patch("mainpro.DisplayManager.apply") as apply_display:
+            for pet_kind in ("capybara", "red_panda", "penguin", "mint_bunny"):
+                with self.subTest(pet_kind=pet_kind):
+                    self.window.pet_skin_buttons[pet_kind].click()
+                    self.assertEqual(self.window.pet_kind, pet_kind)
+                    self.assertEqual(self.window.pet._pet_kind, pet_kind)
+                    self.assertEqual(self.window.pet_preview._pet_kind, pet_kind)
+                    self.assertEqual(self.window.pet._outfit, outfit)
+                    self.assertEqual(self.window.pet_preview._outfit, outfit)
+                    self.assertEqual(self.window._pet_progress.completed_rests, 12)
+                    self.assertEqual(self.window._work_clock.remaining_seconds, 937)
+                    self.assertFalse(self.window.pet_enabled)
+                    self.assertTrue(self.window.pet_skin_buttons[pet_kind].isChecked())
+                    self.assertEqual(sum(button.isChecked() for button in
+                                         self.window.pet_skin_buttons.values()), 1)
+                    self.assertTrue(self.window._save_timer.isActive())
+                    self.window._save_timer.stop()
+                    self.window._save_timer.timeout.emit()
+                    with open(self.config_path, encoding="utf-8") as handle:
+                        saved = json.load(handle)
+                    self.assertEqual(saved["pet_kind"], pet_kind)
+                    self.assertEqual(saved["pet_outfit"], list(outfit))
+                    self.assertEqual(saved["pet_completed_rests"], 12)
+                    restored = mainpro.CareEyesApp.__new__(mainpro.CareEyesApp)
+                    restored.load_settings()
+                    self.assertEqual(restored.pet_kind, pet_kind)
+                    self.assertEqual(restored._pet_progress.outfit, outfit)
+                    self.assertEqual(restored._pet_progress.completed_rests, 12)
+                    self.assertEqual(restored.pet_interaction_mode, "stretch")
+            apply_display.assert_not_called()
+
+    def test_expanded_skin_gallery_is_reachable_at_compact_sizes(self):
+        self.assertEqual(mainpro.DesktopPet.FEATURED_PETS,
+                         ("capybara", "red_panda", "penguin"))
+        older_skins = set(mainpro.DesktopPet.PET_STYLES) - set(mainpro.DesktopPet.FEATURED_PETS)
+        self.assertEqual(self.window.pet_more_button.text(),
+                         f"更多外观 · {len(older_skins)} 款")
+        more_layout = self.window.pet_more_skins.layout()
+        self.assertEqual({more_layout.itemAt(index).widget().pet_kind
+                          for index in range(more_layout.count())}, older_skins)
+        self.window._nav(3)
+        self.window.show()
+        self.window.pet_more_button.setChecked(True)
+        for width, height in ((860, 640), (760, 560)):
+            self.window.resize(width, height)
+            self.application.processEvents()
+            self.assertTrue(self.window.pet_more_skins.isVisible())
+            for pet_kind, button in self.window.pet_skin_buttons.items():
+                with self.subTest(size=(width, height), pet_kind=pet_kind):
+                    self.window.pet_scroll.ensureWidgetVisible(button, 0, 0)
+                    self.application.processEvents()
+                    viewport = self.window.pet_scroll.viewport()
+                    center = button.mapTo(viewport, button.rect().center())
+                    self.assertTrue(viewport.rect().contains(center))
+        self.window.pet_more_button.setChecked(False)
+        self.assertTrue(self.window.pet_more_skins.isHidden())
+
     def test_pet_interaction_modes_render_and_persist(self):
         pet = self.window.pet
         self.assertEqual(pet.interaction_mode, "move")
@@ -667,6 +730,56 @@ class PetArtworkTests(unittest.TestCase):
         finally:
             painter.end()
         return image
+
+    def test_new_skins_have_registered_renderers_and_complete_palettes(self):
+        expected = {"capybara": "焦糖水豚", "red_panda": "枫叶小熊猫", "penguin": "雪团企鹅"}
+        for pet_kind, label in expected.items():
+            with self.subTest(pet_kind=pet_kind):
+                style = mainpro.DesktopPet.PET_STYLES[pet_kind]
+                self.assertEqual(style["label"], label)
+                self.assertEqual(style["renderer"], pet_kind)
+                self.assertIn(pet_kind, mainpro.DesktopPet.ART_TOP)
+                self.assertEqual(set(style["palette"]), {"idle", "tired", "resting", "off"})
+                for palette in style["palette"].values():
+                    self.assertEqual(len(palette), 3)
+                    self.assertTrue(all(QColor(color).isValid() for color in palette))
+                renderer = getattr(self.preview, f"_paint_{pet_kind}")
+                with patch.object(self.preview, f"_paint_{pet_kind}", wraps=renderer) as draw:
+                    self._render(pet_kind)
+                draw.assert_called_once()
+
+    def test_new_skins_are_distinct_silhouettes_not_palette_swaps(self):
+        new_skins = ("capybara", "red_panda", "penguin")
+        silhouettes = {}
+        for pet_kind in mainpro.DesktopPet.PET_STYLES:
+            image = self._render(pet_kind, decoration=())
+            silhouettes[pet_kind] = bytes(value > 127 for value in self._image_bytes(image)[3::4])
+        for pet_kind in new_skins:
+            for other_kind, silhouette in silhouettes.items():
+                if other_kind != pet_kind:
+                    with self.subTest(pet_kind=pet_kind, other_kind=other_kind):
+                        self.assertNotEqual(silhouettes[pet_kind], silhouette)
+
+    def test_new_skin_outfits_leave_eyes_unobstructed_in_every_state(self):
+        top = mainpro.DesktopPet.BODY_TOP + math.sin(.35) * 3
+        eyes = QRect(43, round(top + 29), 65, 27)
+        for pet_kind in ("capybara", "red_panda", "penguin"):
+            for state in ("idle", "tired", "resting", "off"):
+                bare = self._render(pet_kind, state, decoration=())
+                for outfit in (("scarf", "sprout", "star_pin"),
+                               ("scarf", "star_pin", "night_cap")):
+                    with self.subTest(pet_kind=pet_kind, state=state, outfit=outfit):
+                        dressed = self._render(pet_kind, state, decoration=outfit)
+                        self.assertEqual(self._image_bytes(bare.copy(eyes)),
+                                         self._image_bytes(dressed.copy(eyes)))
+                        self.assertNotEqual(self._image_bytes(bare), self._image_bytes(dressed))
+
+    def test_penguin_star_pin_attaches_to_the_head(self):
+        anchor_y = round(mainpro.DesktopPet.BODY_TOP + math.sin(.35) * 3 + 18)
+        bare = self._render("penguin", decoration=())
+        pinned = self._render("penguin", decoration="star_pin")
+        self.assertGreaterEqual(bare.pixelColor(103, anchor_y).alpha(), 240)
+        self.assertEqual(pinned.pixelColor(103, anchor_y), QColor("#e5ca8c"))
 
     def test_all_skins_states_and_decorations_fit_the_canvas(self):
         for pet_kind, style in mainpro.DesktopPet.PET_STYLES.items():

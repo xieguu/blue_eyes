@@ -14,7 +14,7 @@ CareEyes Pro 是一款面向 Windows 的轻量护眼工具。它把屏幕色温�
 - 全屏检测：检测到全屏应用时，会把休息提醒顺延 5 分钟。
 - 用眼统计：展示今日用眼、休息次数、连续用眼和近 7 天趋势。
 - 统计导出：将最近 32 个自然日内已有的用眼记录导出为 CSV，支持 Excel 直接打开。
-- 独立桌宠中心：动态大预览、9 款形象、组合换装、陪伴等级、奖励解锁、休息进度和 5 种互动玩法。
+- 独立桌宠中心：动态大预览、12 款形象、组合换装、陪伴等级、奖励解锁、休息进度和 5 种互动玩法。
 - 系统托盘：关闭主窗口后继续后台运行，可从托盘恢复、切换护眼或退出。
 - 多显示器支持：对多个显示器应用 Gamma 设置，并在退出时尝试恢复原始曲线。
 - 单实例保护：重复启动时会唤起已运行实例，避免多个进程互相覆盖显示设置。
@@ -67,16 +67,16 @@ date,usage_minutes
 
 桌宠是顶部导航中的独立功能页，不再放在“设置”页里。启动程序后点击顶部的“桌宠”即可打开桌宠中心：
 
-- 左侧是动态大预览、等级与成长条，右侧是外观、衣柜和下一件奖励；三款主角直接展示，其余六款可通过“更多外观”展开。
+- 左侧是动态大预览、等级与成长条，右侧是外观、衣柜和下一件奖励；焦糖水豚、枫叶小熊猫、雪团企鹅直接展示，其余九款可通过“更多外观”展开。
 - 点击皮肤卡片会立即替换桌面上的悬浮桌宠，并保存为下次启动的默认外观。
 - 页面右上角或预览下方的开关可以独立显示/隐藏桌宠；该状态会和系统托盘菜单同步。
 - 底部显示当前情绪、休息倒计时与进度；“互动玩法”可展开原有玩法和小彩蛋。较小窗口可纵向滚动，控件不会被裁掉。
 
 当前可选外观：
 
-九款桌宠采用低饱和配色、柔和渐变和独立轮廓；以下图片直接由程序中的绘制代码生成，并非概念图：
+十二款桌宠采用低饱和配色、柔和渐变和独立轮廓；以下图片直接由程序中的绘制代码生成，并非概念图：
 
-![九款桌宠实际效果](docs/images/pet-lineup.png)
+![十二款桌宠实际效果](docs/images/pet-lineup.png)
 
 | 外观 | 特点 |
 | --- | --- |
@@ -89,6 +89,13 @@ date,usage_minutes
 | 小海鸥 | 珍珠白柔光身体、小翅膀、头顶翘毛和暖黄色小脚 |
 | 奶油猫 | 奶油毛色、额头条纹、粉色耳朵与弯尾 |
 | 像素机器人 | 阶梯轮廓、机身高光和像素表情，配饰不会遮住心形指示灯 |
+| 焦糖水豚 | 焦糖毛色、小圆耳、宽鼻吻与短爪，安静陪伴的慢节奏伙伴 |
+| 枫叶小熊猫 | 枫糖毛色、奶白面罩、泪痕与会轻摆的环纹蓬松尾巴 |
+| 雪团企鹅 | 雾蓝羽毛、心形白肚、摆动的小鳍与暖黄色鸟喙和脚掌 |
+
+三款新皮肤无需解锁，直接在桌宠中心首屏选择。切换会沿用当前成长等级、服装与互动玩法，不重置休息倒计时，也不改变桌宠显隐和护眼设置；原有九款皮肤和存档继续可用。
+
+![三款新皮肤实际效果](docs/images/pet-new-skins.png)
 
 所有外观都支持眨眼、视线跟随和状态表情，挠痒痒与开心彩蛋会切换笑眼。围巾适配各角色的身体比例，机器人使用像素化配饰；捏压、拉伸和抛掷时会自动限制绘制范围，避免耳朵或尾巴被窗口裁切。
 
@@ -118,8 +125,9 @@ date,usage_minutes
 生成实际界面预览（使用临时配置，不控制真实屏幕色温）：
 
 ```powershell
-python docs/previews/render_pet_studio.py --rests 4
-python docs/previews/render_pet_studio.py --rests 12 --outfit scarf star_pin night_cap --output tmp/pet-studio-unlocked.png
+python docs/previews/render_pet_studio.py --pet-kind capybara --rests 4
+python docs/previews/render_pet_studio.py --pet-kind red_panda --rests 12 --outfit scarf star_pin night_cap --output tmp/pet-studio-unlocked.png
+python docs/previews/render_pet_studio.py --pet-kind penguin --width 760 --height 560 --more-skins --output tmp/pet-studio-compact.png
 ```
 
 ## 后台资源管理
@@ -175,13 +183,15 @@ python mainpro.py
 python -m unittest discover -s tests -v
 ```
 
-当前包含 137 项测试，覆盖 Gamma 恢复、单实例保护、休息调度、免打扰与统计独立性、CSV 导出、原子写入失败、渐变延迟/连续切换、启动清理、桌宠独立页面、9 款皮肤的状态/配饰渲染、眨眼与视线跟随、互动裁切保护、缩略图/高 DPI 缩放和基础 UI 行为。
+当前包含 143 项测试，覆盖 Gamma 恢复、单实例保护、休息调度、免打扰与统计独立性、CSV 导出、原子写入失败、渐变延迟/连续切换、启动清理、桌宠独立页面、12 款皮肤的状态/配饰渲染、眨眼与视线跟随、互动裁切保护、缩略图/高 DPI 缩放，以及新皮肤的选择持久化、成长保留、独立轮廓和小窗口滚动选择。
 
 生成桌宠实际效果图（离屏绘制，不启动护眼效果、不读取用户配置）：
 
 ```powershell
 python docs/previews/render_pet_gallery.py --output tmp/pet-gallery.png
 python docs/previews/render_pet_gallery.py --states --output tmp/pet-states.png
+python docs/previews/render_pet_gallery.py --kinds capybara red_panda penguin --output tmp/pet-new-skins.png
+python docs/previews/render_pet_gallery.py --kinds capybara red_panda penguin --states --outfit scarf star_pin night_cap --output tmp/pet-new-outfits.png
 ```
 
 ## 打包
@@ -233,7 +243,7 @@ C:\Users\<用户名>\.care_eyes_pro.json
 }
 ```
 
-`pet_kind` 可选值：`blue_cat`、`orange_fox`、`mint_bunny`、`purple_owl`、`pink_poodle`、`charcoal_cat`、`seagull`、`cream_cat`、`pixel_robot`。
+`pet_kind` 可选值：`blue_cat`、`orange_fox`、`mint_bunny`、`purple_owl`、`pink_poodle`、`charcoal_cat`、`seagull`、`cream_cat`、`pixel_robot`、`capybara`、`red_panda`、`penguin`。
 
 其中 `pet_enabled` 控制桌面悬浮宠物是否显示，`pet_kind` 控制当前皮肤，`pet_interaction_mode` 控制互动玩法，`pet_pos` 保存桌宠最后一次移动后的位置。推荐在桌宠中心修改这些选项，不需要手动编辑配置文件。
 

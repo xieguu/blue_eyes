@@ -827,12 +827,11 @@ class DesktopPet(QWidget):
         "blue_cat": -9, "orange_fox": -12, "mint_bunny": -31,
         "purple_owl": -4, "pink_poodle": 2, "charcoal_cat": -9,
         "seagull": -7, "cream_cat": -13, "pixel_robot": -22,
+        "capybara": -4, "red_panda": -8, "penguin": -5,
     }
 
     DEFAULT_PET_KIND = "blue_cat"
-    # 首屏只展示概念图中的三款主角；旧皮肤仍保留在“更多外观”中，
-    # 这样升级不会让已有配置失效，也不会让相似的圆形角色挤在一起。
-    FEATURED_PETS = ("seagull", "cream_cat", "pixel_robot")
+    FEATURED_PETS = ("capybara", "red_panda", "penguin")
     DEFAULT_DECORATION = "scarf"
 
     # 参考 momo-soft-play 的四种软体玩法；额外保留轻戳模式，方便
@@ -1001,6 +1000,24 @@ class DesktopPet(QWidget):
                 "resting": ("#789db2", "#a3acc8", "#26334d"),
                 "off": ("#64748b", "#475569", "#1e293b"),
             },
+        },
+        "capybara": {
+            "label": "焦糖水豚",
+            "tagline": "慢慢来，发会儿呆也很不错。",
+            "renderer": "capybara",
+            "palette": _make_palette("#c5a078", "#a47c58", "#efdbc0"),
+        },
+        "red_panda": {
+            "label": "枫叶小熊猫",
+            "tagline": "把忙碌放下，和我伸个懒腰。",
+            "renderer": "red_panda",
+            "palette": _make_palette("#d58c62", "#865347", "#fff0da"),
+        },
+        "penguin": {
+            "label": "雪团企鹅",
+            "tagline": "摇摇摆摆，陪你走一小段。",
+            "renderer": "penguin",
+            "palette": _make_palette("#7899b6", "#526f8e", "#f0f6fc"),
         },
     }
 
@@ -1677,7 +1694,7 @@ class DesktopPet(QWidget):
         p.drawEllipse(QRectF(self.W / 2 + motion["x"] * .22 - sw / 2,
                             shadow_y, sw, max(6, 12 - abs(motion["y"]) * .06)))
 
-        # 角色本体使用同一个局部坐标系，所以九种皮肤都能获得一致的
+        # 角色本体使用同一个局部坐标系，所以所有皮肤都能获得一致的
         # squish / stretch / wobble 效果，不需要复制每个 renderer 的路径。
         pivot_x = self.W / 2
         pivot_y = top + 58
@@ -1722,6 +1739,12 @@ class DesktopPet(QWidget):
             self._paint_pink_poodle(p, top, body, light, belly)
         elif renderer == "charcoal_cat":
             self._paint_charcoal_cat(p, top, body, light, belly)
+        elif renderer == "capybara":
+            self._paint_capybara(p, top, body, light, belly)
+        elif renderer == "red_panda":
+            self._paint_red_panda(p, top, body, light, belly)
+        elif renderer == "penguin":
+            self._paint_penguin(p, top, body, light, belly)
         else:
             wag = math.sin(self._phase * 1.7) * 9
             if style["tail"] == "puff":
@@ -2331,6 +2354,159 @@ class DesktopPet(QWidget):
     def _paint_charcoal_cat(self, painter, top, body, light, belly):
         self._paint_cat_character(painter, top, body, light, belly)
 
+    def _paint_capybara(self, painter, top, body, light, belly):
+        for ear_x in (34, 96):
+            self._pet_ellipse(painter, ear_x, top - 2, 20, 24,
+                              self._pet_gradient(body, top - 2, 24), light)
+            self._pet_ellipse(painter, ear_x + 5, top + 3, 10, 15, light)
+
+        silhouette = QPainterPath(QPointF(39, top + 20))
+        silhouette.cubicTo(46, top + 6, 101, top + 5, 112, top + 23)
+        silhouette.cubicTo(124, top + 39, 125, top + 66, 118, top + 84)
+        silhouette.cubicTo(114, top + 100, 96, top + 105, 75, top + 104)
+        silhouette.cubicTo(47, top + 106, 30, top + 95, 29, top + 75)
+        silhouette.cubicTo(25, top + 50, 28, top + 32, 39, top + 20)
+        self._paint_soft_body(painter, silhouette, top, body)
+        self._pet_ellipse(painter, 47, top + 70, 57, 31,
+                          self._pet_gradient(belly, top + 70, 31))
+        for paw_x in (33, 105):
+            self._pet_ellipse(painter, paw_x, top + 74, 12, 26,
+                              self._pet_gradient(body, top + 74, 26))
+        self._paint_paws(painter, top, light, (49, 101), 27)
+
+        for tuft_x in (66, 75, 84):
+            tuft = QPainterPath(QPointF(tuft_x - 2, top + 16))
+            tuft.quadTo(tuft_x - 3, top + 20, tuft_x, top + 22)
+            self._fill_path(painter, tuft, Qt.NoBrush, light, 1.2)
+        self._paint_rounded_eyes(painter, (49, 101), top + 32, "#503e33", 8.5, 11)
+        self._paint_cheeks(painter, top + 49, (36, 114))
+        self._pet_ellipse(painter, 41, top + 43, 68, 28,
+                          self._pet_gradient(belly, top + 42, 30),
+                          QColor(body).darker(106))
+        for nostril_x in (68, 79):
+            self._pet_ellipse(painter, nostril_x, top + 54, 2.7, 3.3, "#70513d")
+        mouth = QPainterPath(QPointF(64, top + 63))
+        mouth.quadTo(75, top + 69, 86, top + 63)
+        self._fill_path(painter, mouth, Qt.NoBrush, "#70513d", 1.35)
+        self._paint_sleep_marks(painter, 119, top + 23, "#d4bd94")
+
+    def _paint_red_panda(self, painter, top, body, light, belly):
+        wag = math.sin(self._phase * 1.7) * 3
+        painter.save()
+        painter.translate(wag * .18, wag)
+        tail = QPainterPath(QPointF(107, top + 94))
+        tail.cubicTo(136, top + 99, 143, top + 76, 136, top + 53)
+        tail.cubicTo(131, top + 35, 122, top + 23, 116, top + 22)
+        tail.cubicTo(107, top + 22, 109, top + 36, 116, top + 46)
+        tail.cubicTo(128, top + 68, 123, top + 78, 105, top + 76)
+        tail.closeSubpath()
+        self._fill_path(painter, tail, self._pet_gradient(body, top + 22, 76), light, .8)
+        painter.setClipPath(tail)
+        for stripe_x, stripe_y in ((116, 34), (128, 53), (132, 73), (118, 90)):
+            stripe = QPainterPath(QPointF(stripe_x - 11, top + stripe_y - 2))
+            stripe.quadTo(stripe_x, top + stripe_y + 4,
+                          stripe_x + 12, top + stripe_y - 3)
+            self._fill_path(painter, stripe, Qt.NoBrush, light, 8)
+        painter.restore()
+
+        for ear_x in (31, 92):
+            self._pet_ellipse(painter, ear_x, top - 5, 28, 32, belly,
+                              QColor(body).darker(112))
+            self._pet_ellipse(painter, ear_x + 6, top + 1, 16, 23, light)
+        silhouette = QPainterPath(QPointF(34, top + 26))
+        silhouette.cubicTo(41, top + 7, 105, top + 6, 117, top + 27)
+        silhouette.quadTo(125, top + 39, 121, top + 49)
+        silhouette.lineTo(128, top + 57)
+        silhouette.lineTo(120, top + 61)
+        silhouette.lineTo(123, top + 66)
+        silhouette.quadTo(117, top + 77, 108, top + 80)
+        silhouette.cubicTo(111, top + 98, 91, top + 104, 74, top + 104)
+        silhouette.cubicTo(51, top + 104, 37, top + 95, 40, top + 81)
+        silhouette.quadTo(29, top + 74, 26, top + 65)
+        silhouette.lineTo(32, top + 60)
+        silhouette.lineTo(25, top + 54)
+        silhouette.quadTo(25, top + 38, 34, top + 26)
+        self._paint_soft_body(painter, silhouette, top, body)
+
+        chest = QPainterPath(QPointF(51, top + 68))
+        chest.quadTo(75, top + 80, 99, top + 68)
+        chest.quadTo(103, top + 99, 75, top + 102)
+        chest.quadTo(47, top + 99, 51, top + 68)
+        self._fill_path(painter, chest, self._pet_gradient(light, top + 68, 34))
+        self._paint_paws(painter, top, light, (49, 101), 24)
+        for direction in (-1, 1):
+            mask = QPainterPath(QPointF(75 + direction * 6, top + 48))
+            mask.cubicTo(75 + direction * 16, top + 25,
+                         75 + direction * 36, top + 27,
+                         75 + direction * 40, top + 43)
+            mask.quadTo(75 + direction * 49, top + 57,
+                        75 + direction * 29, top + 65)
+            mask.quadTo(75 + direction * 8, top + 69,
+                        75 + direction * 6, top + 48)
+            self._fill_path(painter, mask, self._pet_gradient(belly, top + 30, 38))
+            tear = QPainterPath(QPointF(75 + direction * 22, top + 46))
+            tear.quadTo(75 + direction * 29, top + 49,
+                        75 + direction * 28, top + 59)
+            tear.quadTo(75 + direction * 21, top + 57,
+                        75 + direction * 19, top + 49)
+            tear.closeSubpath()
+            self._fill_path(painter, tear, light)
+            self._pet_ellipse(painter, 69 + direction * 21, top + 25, 12, 5, belly)
+        self._pet_ellipse(painter, 56, top + 51, 38, 20, belly)
+        self._paint_rounded_eyes(painter, (54, 96), top + 37, "#392f30", 9, 13)
+        self._paint_cheeks(painter, top + 57, (39, 111))
+        self._paint_muzzle(painter, top + 56, "#483735", "#634438")
+        self._paint_sleep_marks(painter, 120, top + 19, "#e5bc93")
+
+    def _paint_penguin(self, painter, top, body, light, belly):
+        feet = "#e7b26b" if self._state != "off" else "#a4aaa9"
+        self._paint_paws(painter, top, feet, (52, 98), 26)
+        silhouette = QPainterPath(QPointF(74, top + 5))
+        silhouette.cubicTo(49, top + 3, 35, top + 26, 38, top + 52)
+        silhouette.cubicTo(27, top + 71, 30, top + 96, 52, top + 103)
+        silhouette.quadTo(75, top + 109, 98, top + 103)
+        silhouette.cubicTo(121, top + 96, 123, top + 70, 112, top + 52)
+        silhouette.cubicTo(115, top + 29, 103, top + 7, 83, top + 5)
+        silhouette.quadTo(85, top - 3, 79, top - 2)
+        silhouette.quadTo(75, top, 74, top + 5)
+        self._paint_soft_body(painter, silhouette, top, body)
+
+        bib = QPainterPath(QPointF(75, top + 33))
+        bib.cubicTo(60, top + 14, 42, top + 27, 46, top + 49)
+        bib.cubicTo(34, top + 78, 48, top + 99, 75, top + 100)
+        bib.cubicTo(102, top + 99, 116, top + 78, 104, top + 49)
+        bib.cubicTo(108, top + 27, 90, top + 14, 75, top + 33)
+        self._fill_path(painter, bib, self._pet_gradient(belly, top + 25, 78))
+
+        flap = math.sin(self._phase * 1.7) * 3
+        for direction in (-1, 1):
+            flipper = QPainterPath(QPointF(75 + direction * 35, top + 47))
+            flipper.cubicTo(75 + direction * 50, top + 52 + direction * flap,
+                            75 + direction * 52, top + 74 + direction * flap,
+                            75 + direction * 45, top + 85 + direction * flap)
+            flipper.cubicTo(75 + direction * 33, top + 82,
+                            75 + direction * 27, top + 60,
+                            75 + direction * 35, top + 47)
+            self._fill_path(painter, flipper,
+                            self._pet_gradient(light, top + 46, 42),
+                            QColor(light).darker(110), .8)
+            feather = QPainterPath(QPointF(75 + direction * 41, top + 61))
+            feather.quadTo(75 + direction * 43, top + 71,
+                           75 + direction * 42, top + 76)
+            self._fill_path(painter, feather, Qt.NoBrush, body, 1.1)
+
+        self._paint_rounded_eyes(painter, (58, 92), top + 36, "#2e4055", 9.5, 14)
+        self._paint_cheeks(painter, top + 53, (46, 104))
+        beak = QPainterPath(QPointF(68, top + 55))
+        beak.quadTo(75, top + 51, 82, top + 55)
+        beak.quadTo(82, top + 60, 75, top + 65)
+        beak.quadTo(68, top + 60, 68, top + 55)
+        self._fill_path(painter, beak, self._pet_gradient(feet, top + 53, 12))
+        fold = QPainterPath(QPointF(69, top + 56))
+        fold.quadTo(75, top + 59, 81, top + 56)
+        self._fill_path(painter, fold, Qt.NoBrush, QColor(feet).darker(119), .9)
+        self._paint_sleep_marks(painter, 119, top + 23, "#b3d8e9")
+
     def _paint_decoration(self, painter, top, decoration):
         """绘制独立于角色本体的可切换装饰。"""
         if decoration == "scarf":
@@ -2364,11 +2540,12 @@ class DesktopPet(QWidget):
             leaf.cubicTo(95, anchor - 18, 85, anchor - 12, 77, anchor - 14)
             self._fill_path(painter, leaf, self._pet_gradient("#b0dcb3", anchor - 28, 16))
         elif decoration == "star_pin":
+            pin_x, pin_y = (103, top + 18) if self._pet_kind == "penguin" else (111, top + 8)
             star = QPainterPath()
             for point_index in range(10):
                 angle = point_index * math.pi / 5 - math.pi / 2
                 radius = 8 if point_index % 2 == 0 else 3.8
-                point = QPointF(111 + math.cos(angle) * radius, top + 8 + math.sin(angle) * radius)
+                point = QPointF(pin_x + math.cos(angle) * radius, pin_y + math.sin(angle) * radius)
                 if point_index == 0:
                     star.moveTo(point)
                 else:
@@ -3898,6 +4075,7 @@ class CareEyesApp(QWidget):
         pet_order = list(DesktopPet.FEATURED_PETS) + [
             kind for kind in DesktopPet.PET_STYLES if kind not in DesktopPet.FEATURED_PETS
         ]
+        featured_count = len(DesktopPet.FEATURED_PETS)
         for index, pet_kind in enumerate(pet_order):
             info = DesktopPet.PET_STYLES[pet_kind]
             button = PetSkinCard(pet_kind, info, skin_card)
@@ -3905,15 +4083,16 @@ class CareEyesApp(QWidget):
                 lambda _, kind=pet_kind: self._select_pet_skin(kind)
             )
             self.pet_skin_buttons[pet_kind] = button
-            if index < 3:
-                skin_grid.addWidget(button, 0, index)
+            if index < featured_count:
+                skin_grid.addWidget(button, index // 3, index % 3)
             else:
-                more_grid.addWidget(button, (index - 3) // 3, (index - 3) % 3)
+                more_index = index - featured_count
+                more_grid.addWidget(button, more_index // 3, more_index % 3)
         for column in range(3):
             skin_grid.setColumnStretch(column, 1)
             more_grid.setColumnStretch(column, 1)
         skin_layout.addLayout(skin_grid, 1)
-        self.pet_more_button = QPushButton("更多外观 · 6 款")
+        self.pet_more_button = QPushButton(f"更多外观 · {len(pet_order) - featured_count} 款")
         self.pet_more_button.setCheckable(True)
         self.pet_more_button.setCursor(Qt.PointingHandCursor)
         self.pet_more_button.setFixedHeight(22)
