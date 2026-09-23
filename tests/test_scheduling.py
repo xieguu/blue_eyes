@@ -54,9 +54,11 @@ class SchedulingTests(unittest.TestCase):
             "stat_today", "stat_session", "stat_breaks", "day_ring", "bar_chart",
             "toggle", "toggle_label", "guard_timer", "auto_status_lbl",
             "_transition", "_dim_mgr", "_metrics",
-            "stat_timer", "countdown_timer", "auto_timer", "metrics_timer", "_save_timer",
+            "stat_timer", "countdown_timer", "auto_timer", "metrics_timer",
+            "_effect_timer", "_save_timer",
         ):
             setattr(self.app, name, Mock())
+        self.app._effect_timer.isActive.return_value = False
         self.app._schedule_save = Mock()
         self.app._open_main = Mock()
         self.app._is_fullscreen = Mock(return_value=False)

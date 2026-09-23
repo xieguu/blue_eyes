@@ -9,7 +9,7 @@ class PetProgressTests(unittest.TestCase):
         self.assertEqual(progress.level, 1)
         self.assertEqual(progress.experience, 0)
         self.assertEqual(progress.outfit, ("scarf", "sprout"))
-        self.assertEqual(progress.next_unlock, ("star_pin", 6))
+        self.assertEqual(progress.next_unlock, ("round_glasses", 3))
 
     def test_each_completed_rest_gives_experience_and_two_level_up(self):
         progress = PetProgress()
@@ -32,11 +32,11 @@ class PetProgressTests(unittest.TestCase):
         self.assertFalse(progress.is_unlocked("star_pin"))
         self.assertEqual(progress.complete_rest(), ("star_pin",))
         self.assertTrue(progress.is_unlocked("star_pin"))
-        self.assertEqual(progress.next_unlock, ("night_cap", 12))
+        self.assertEqual(progress.next_unlock, ("heart_badge", 9))
         self.assertEqual(progress.complete_rest(), ())
         progress = PetProgress(11)
         self.assertEqual(progress.complete_rest(), ("night_cap",))
-        self.assertIsNone(progress.next_unlock)
+        self.assertEqual(progress.next_unlock, ("moon_charm", 15))
         self.assertEqual(progress.complete_rest(), ())
 
     def test_locked_and_unknown_items_cannot_be_equipped(self):

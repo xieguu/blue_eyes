@@ -59,7 +59,9 @@ def render_studio(output, completed_rests=4, outfit=None, width=1120, height=760
         try:
             window.resize(width, height)
             window._nav(3)
-            window.pet_more_button.setChecked(show_more)
+            if show_more:
+                bar = window.pet_skin_scroller.horizontalScrollBar()
+                bar.setValue(bar.maximum())
             window._work_clock.restart(18 * 60 + 42)
             window.show()
             application.processEvents()

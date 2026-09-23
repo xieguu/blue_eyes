@@ -42,6 +42,7 @@ class OffscreenUiTests(unittest.TestCase):
         patches = [
             patch("mainpro.CONFIG_FILE", config_path),
             patch("mainpro.DisplayManager.apply", return_value=True),
+            patch("mainpro.DisplayManager.ensure", return_value=True),
             patch("mainpro.DisplayManager.reset", return_value=True),
             patch("mainpro.WindowsActivityMonitor"),
             patch("mainpro.CareEyesApp.init_tray", fake_tray),
@@ -162,6 +163,12 @@ class OffscreenUiTests(unittest.TestCase):
         self.assertEqual(self.window._settings_error, "")
         self.assertEqual(self.window.config_status_label.text(), "设置已保存")
 
+    def test_immediate_save_consumes_pending_debounced_save(self):
+        self.window._schedule_save()
+        self.assertTrue(self.window._save_timer.isActive())
+        self.assertTrue(self.window._save_settings())
+        self.assertFalse(self.window._save_timer.isActive())
+
     def test_nonfinite_settings_never_replace_valid_configuration(self):
         with open(self.config_path, "rb") as handle:
             original = handle.read()
@@ -175,12 +182,27 @@ class OffscreenUiTests(unittest.TestCase):
 
     def test_gamma_guard_does_not_overwrite_active_transition(self):
         self.window.apply_preset("睡眠")
-        with patch("mainpro.DisplayManager.apply") as apply:
+        with patch("mainpro.DisplayManager.ensure") as ensure:
             self.window._guard_apply()
-            apply.assert_not_called()
+            ensure.assert_not_called()
             self.window._transition.stop()
             self.window._guard_apply()
-            apply.assert_called_once_with(2500, 0.55)
+            ensure.assert_called_once_with(2500, 0.55)
+
+            self.window.temp_slider.setValue(2600)
+            self.assertTrue(self.window._effect_timer.isActive())
+            self.window._guard_apply()
+            ensure.assert_called_once_with(2500, 0.55)
+
+    def test_slider_changes_coalesce_to_one_final_display_write(self):
+        with patch("mainpro.DisplayManager.apply", return_value=True) as apply:
+            for temperature in range(5100, 5201, 10):
+                self.window.temp_slider.setValue(temperature)
+            apply.assert_not_called()
+            self.assertTrue(self.window._effect_timer.isActive())
+            self.window._effect_timer.stop()
+            self.window._effect_timer.timeout.emit()
+        apply.assert_called_once_with(5200, self.window.bright)
 
     def test_hidden_window_keeps_required_timers_only(self):
         self.assertFalse(self.window.pet._anim_timer.isActive())
@@ -277,19 +299,24 @@ class OffscreenUiTests(unittest.TestCase):
             self.assertEqual(refresh.call_count, 3)
             self.assertEqual(reset.call_count, 3)
 
-    def test_countdown_refreshes_pet_page_only_when_visible_and_once(self):
-        with patch.object(self.window, "_sync_pet_page") as refresh:
-            self.window._refresh_countdown()
-            refresh.assert_not_called()
-            self.window.show()
-            self.window._nav(3)
-            refresh.reset_mock()
-            self.window._refresh_countdown()
-            refresh.assert_called_once()
-            self.window.hide()
-            refresh.reset_mock()
-            self.window._refresh_countdown()
-            refresh.assert_not_called()
+    def test_countdown_refreshes_only_dynamic_pet_status_when_visible(self):
+        with patch.object(self.window, "_refresh_pet_status") as refresh:
+            with patch.object(self.window, "_sync_pet_page") as full_refresh:
+                self.window._refresh_countdown()
+                refresh.assert_not_called()
+                full_refresh.assert_not_called()
+                self.window.show()
+                self.window._nav(3)
+                full_refresh.assert_called_once()
+                refresh.reset_mock()
+                full_refresh.reset_mock()
+                self.window._refresh_countdown()
+                refresh.assert_called_once()
+                full_refresh.assert_not_called()
+                self.window.hide()
+                refresh.reset_mock()
+                self.window._refresh_countdown()
+                refresh.assert_not_called()
 
     def test_cleanup_stops_previews_and_pet_timers(self):
         self.window.show()
@@ -305,6 +332,7 @@ class OffscreenUiTests(unittest.TestCase):
             self.window.guard_timer,
             self.window.countdown_timer,
             self.window.metrics_timer,
+            self.window._effect_timer,
         ):
             self.assertFalse(timer.isActive())
 
@@ -320,7 +348,7 @@ class OffscreenUiTests(unittest.TestCase):
 
     def test_starter_outfit_and_locked_rewards_are_visible(self):
         self.assertEqual(self.window.pet_level_label.text(), "Lv. 1")
-        self.assertEqual(self.window.pet_reward_count.text(), "0 / 6")
+        self.assertEqual(self.window.pet_reward_count.text(), "0 / 3")
         self.assertEqual(self.window.pet_experience_progress.maximum(), 20)
         for decoration in ("scarf", "sprout"):
             self.assertTrue(self.window.pet_outfit_buttons[decoration].isEnabled())
@@ -355,7 +383,7 @@ class OffscreenUiTests(unittest.TestCase):
         self.window._sync_pet_progress()
         self.window.pet_outfit_buttons["star_pin"].click()
         self.assertEqual(self.window.pet._outfit, ("scarf", "sprout", "star_pin"))
-        self.assertEqual(self.window.pet_reward_count.text(), "6 / 12")
+        self.assertEqual(self.window.pet_reward_count.text(), "6 / 9")
         self.assertFalse(self.window.pet_outfit_buttons["night_cap"].isEnabled())
 
     def test_headwear_replaces_sprout_and_remains_equipped_when_skin_changes(self):
@@ -368,7 +396,7 @@ class OffscreenUiTests(unittest.TestCase):
         self.window.pet_skin_buttons["pixel_robot"].click()
         self.assertEqual(self.window.pet_preview._outfit, outfit)
         self.assertEqual(self.window._pet_progress.level, 7)
-        self.assertEqual(self.window.pet_reward_title.text(), "衣柜已集齐")
+        self.assertEqual(self.window.pet_reward_title.text(), "下一个礼物 · 月光吊坠")
         with open(self.config_path, encoding="utf-8") as handle:
             saved = json.load(handle)
         self.assertEqual(saved["pet_outfit"], list(outfit))
@@ -488,9 +516,7 @@ class OffscreenUiTests(unittest.TestCase):
         self.window._nav(3)
         self.application.processEvents()
         self.assertEqual(self.window.pet_page_body.width(), self.window.pet_scroll.viewport().width())
-        self.assertFalse(self.window.pet_more_skins.isVisible())
-        self.window.pet_more_button.click()
-        self.assertTrue(self.window.pet_more_skins.isVisible())
+        self.assertGreater(self.window.pet_skin_scroller.horizontalScrollBar().maximum(), 0)
         self.window.pet_play_toggle.click()
         self.assertTrue(self.window.pet_play_panel.isVisible())
         self.application.processEvents()
@@ -623,31 +649,18 @@ class OffscreenUiTests(unittest.TestCase):
                     self.assertEqual(restored.pet_interaction_mode, "stretch")
             apply_display.assert_not_called()
 
-    def test_expanded_skin_gallery_is_reachable_at_compact_sizes(self):
+    def test_sliding_skin_gallery_is_reachable_at_compact_sizes(self):
         self.assertEqual(mainpro.DesktopPet.FEATURED_PETS,
                          ("capybara", "red_panda", "penguin"))
-        older_skins = set(mainpro.DesktopPet.PET_STYLES) - set(mainpro.DesktopPet.FEATURED_PETS)
-        self.assertEqual(self.window.pet_more_button.text(),
-                         f"更多外观 · {len(older_skins)} 款")
-        more_layout = self.window.pet_more_skins.layout()
-        self.assertEqual({more_layout.itemAt(index).widget().pet_kind
-                          for index in range(more_layout.count())}, older_skins)
-        self.window._nav(3)
-        self.window.show()
-        self.window.pet_more_button.setChecked(True)
-        for width, height in ((860, 640), (760, 560)):
-            self.window.resize(width, height)
-            self.application.processEvents()
-            self.assertTrue(self.window.pet_more_skins.isVisible())
-            for pet_kind, button in self.window.pet_skin_buttons.items():
-                with self.subTest(size=(width, height), pet_kind=pet_kind):
-                    self.window.pet_scroll.ensureWidgetVisible(button, 0, 0)
-                    self.application.processEvents()
-                    viewport = self.window.pet_scroll.viewport()
-                    center = button.mapTo(viewport, button.rect().center())
-                    self.assertTrue(viewport.rect().contains(center))
-        self.window.pet_more_button.setChecked(False)
-        self.assertTrue(self.window.pet_more_skins.isHidden())
+        strip_layout = self.window.pet_skin_strip.layout()
+        self.assertEqual({strip_layout.itemAt(index).widget().pet_kind
+                          for index in range(strip_layout.count())},
+                         set(mainpro.DesktopPet.PET_STYLES))
+        self.assertEqual(strip_layout.count(), len(mainpro.DesktopPet.PET_STYLES))
+        self.assertEqual(
+            self.window.pet_skin_scroller.horizontalScrollBarPolicy(),
+            mainpro.Qt.ScrollBarAsNeeded,
+        )
 
     def test_pet_interaction_modes_render_and_persist(self):
         pet = self.window.pet

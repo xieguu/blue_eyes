@@ -2,6 +2,7 @@ import unittest
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import mainpro
@@ -86,12 +87,49 @@ class DisplayManagerTests(unittest.TestCase):
             self.assertTrue(mainpro.DisplayManager.apply(5000, 0.9))
         self.assertEqual(controller.apply.call_count, 2)
 
+    def test_guard_uses_controller_verification_with_cached_ramp(self):
+        controller = Mock(spec=mainpro.GammaController)
+        controller.ensure.return_value = True
+        with patch.object(mainpro.DisplayManager, "_controller", controller):
+            self.assertTrue(mainpro.DisplayManager.ensure(5000, 0.9))
+            self.assertTrue(mainpro.DisplayManager.ensure(5000, 0.9))
+        self.assertEqual(controller.ensure.call_count, 2)
+        self.assertIs(
+            controller.ensure.call_args_list[0].args[0],
+            controller.ensure.call_args_list[1].args[0],
+        )
+
     def test_ramp_cache_is_bounded(self):
         for sample_index in range(40):
             mainpro.DisplayManager._build_ramp(sample_index / 40, 1.0, 1.0)
         cache = mainpro.DisplayManager._build_ramp.cache_info()
         self.assertEqual(cache.maxsize, 32)
         self.assertEqual(cache.currsize, 32)
+
+
+class UiStateDeduplicationTests(unittest.TestCase):
+    def test_unchanged_preset_state_does_not_reparse_styles(self):
+        buttons = {name: Mock() for name in mainpro.MODES}
+        subject = SimpleNamespace(
+            temp=5000,
+            bright=0.9,
+            mode_btns=buttons,
+            _mode_qss=Mock(side_effect=lambda active: str(active)),
+        )
+        mainpro.CareEyesApp._sync_mode_selection(subject)
+        self.assertEqual(subject._mode_qss.call_count, len(mainpro.MODES))
+
+        subject._mode_qss.reset_mock()
+        for button in buttons.values():
+            button.setStyleSheet.reset_mock()
+        mainpro.CareEyesApp._sync_mode_selection(subject)
+        subject._mode_qss.assert_not_called()
+        for button in buttons.values():
+            button.setStyleSheet.assert_not_called()
+
+        subject.temp = 5100
+        mainpro.CareEyesApp._sync_mode_selection(subject)
+        self.assertEqual(subject._mode_qss.call_count, len(mainpro.MODES))
 
 
 class MetricsTests(unittest.TestCase):

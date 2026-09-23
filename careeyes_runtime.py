@@ -98,6 +98,11 @@ class GammaController:
         self.backend = backend
         self.originals = {}
         self.errors = {}
+        self._canonical_ramps = {}
+
+    @staticmethod
+    def _freeze_ramp(ramp):
+        return tuple(tuple(channel) for channel in ramp)
 
     def apply(self, ramp):
         self.errors = {}
@@ -107,17 +112,51 @@ class GammaController:
             self.errors["displays"] = str(error)
             return False
         applied = False
-        values = tuple(tuple(channel) for channel in ramp)
+        values = self._freeze_ramp(ramp)
         for device in devices:
             try:
                 if device not in self.originals:
                     original = self.backend.read_ramp(device)
-                    self.originals[device] = tuple(tuple(channel) for channel in original)
+                    self.originals[device] = self._freeze_ramp(original)
+                canonical = self._canonical_ramps.get(device)
+                if canonical is not None and canonical[0] != values:
+                    del self._canonical_ramps[device]
                 self.backend.write_ramp(device, values)
                 applied = True
             except OSError as error:
                 self.errors[device] = str(error)
         return applied
+
+    def ensure(self, ramp):
+        """验证当前曲线，仅修复已偏离目标值的显示器。"""
+        self.errors = {}
+        try:
+            devices = self.backend.devices()
+        except OSError as error:
+            self.errors["displays"] = str(error)
+            return False
+        ensured = False
+        values = self._freeze_ramp(ramp)
+        for device in devices:
+            try:
+                current = self._freeze_ramp(self.backend.read_ramp(device))
+                if device not in self.originals:
+                    self.originals[device] = current
+                canonical = self._canonical_ramps.get(device)
+                if (current == values
+                        or (canonical is not None
+                            and canonical[0] == values
+                            and canonical[1] == current)):
+                    self._canonical_ramps[device] = (values, current)
+                    ensured = True
+                    continue
+                self.backend.write_ramp(device, values)
+                observed = self._freeze_ramp(self.backend.read_ramp(device))
+                self._canonical_ramps[device] = (values, observed)
+                ensured = True
+            except OSError as error:
+                self.errors[device] = str(error)
+        return ensured
 
     def restore(self):
         self.errors = {}
@@ -134,6 +173,7 @@ class GammaController:
             try:
                 self.backend.write_ramp(device, original)
                 del self.originals[device]
+                self._canonical_ramps.pop(device, None)
             except OSError as error:
                 self.errors[device] = str(error)
         return not self.originals
@@ -271,8 +311,12 @@ class PetProgress:
     OUTFIT_RULES = {
         "scarf": {"slot": "neck", "rests": 0},
         "sprout": {"slot": "head", "rests": 0},
+        "round_glasses": {"slot": "face", "rests": 3},
         "star_pin": {"slot": "pin", "rests": 6},
+        "heart_badge": {"slot": "pin", "rests": 9},
         "night_cap": {"slot": "head", "rests": 12},
+        "moon_charm": {"slot": "neck", "rests": 15},
+        "tiny_crown": {"slot": "head", "rests": 18},
     }
 
     def __init__(self, completed_rests=0, outfit=None):

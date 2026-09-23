@@ -26,6 +26,7 @@ class FakeGammaBackend:
         self.writes = []
         self.read_failures = set()
         self.write_failures = set()
+        self.quantize_writes = False
 
     def devices(self):
         return self.connected
@@ -40,6 +41,11 @@ class FakeGammaBackend:
         self.writes.append((device, ramp))
         if device in self.write_failures:
             raise OSError("write failed")
+        if self.quantize_writes:
+            ramp = tuple(
+                tuple(value & 0xFF00 for value in channel)
+                for channel in ramp
+            )
         self.ramps[device] = ramp
 
 
@@ -119,6 +125,45 @@ class GammaControllerTests(unittest.TestCase):
         self.assertFalse(self.controller.restore())
         self.assertEqual(self.controller.originals, self.originals)
         self.assertIn("displays", self.controller.errors)
+
+    def test_ensure_skips_matching_displays_and_repairs_external_change(self):
+        target = make_ramp(30)
+        self.assertTrue(self.controller.apply(target))
+        self.backend.writes.clear()
+        self.assertTrue(self.controller.ensure(target))
+        self.assertEqual(self.backend.writes, [])
+
+        self.backend.ramps["primary"] = make_ramp(70)
+        self.assertTrue(self.controller.ensure(target))
+        self.assertEqual(self.backend.writes, [("primary", target)])
+        self.assertEqual(self.backend.ramps["primary"], target)
+
+    def test_ensure_learns_driver_canonical_ramp_without_write_loop(self):
+        target = make_ramp(37)
+        self.backend.quantize_writes = True
+        self.assertTrue(self.controller.apply(target))
+        self.backend.writes.clear()
+
+        self.assertTrue(self.controller.ensure(target))
+        first_guard_writes = list(self.backend.writes)
+        self.assertEqual([device for device, _ in first_guard_writes],
+                         ["primary", "secondary"])
+        for _ in range(5):
+            self.assertTrue(self.controller.ensure(target))
+        self.assertEqual(self.backend.writes, first_guard_writes)
+
+        self.backend.ramps["primary"] = make_ramp(90)
+        self.assertTrue(self.controller.ensure(target))
+        self.assertEqual(len(self.backend.writes), len(first_guard_writes) + 1)
+
+    def test_ensure_read_failure_is_reported_without_blind_write(self):
+        target = make_ramp(30)
+        self.assertTrue(self.controller.apply(target))
+        self.backend.writes.clear()
+        self.backend.read_failures.add("primary")
+        self.assertTrue(self.controller.ensure(target))
+        self.assertEqual(self.backend.writes, [])
+        self.assertIn("primary", self.controller.errors)
 
 
 class SingleInstanceTests(unittest.TestCase):

@@ -430,20 +430,37 @@ class DisplayManager:
         )
 
     @classmethod
-    def apply(cls, temp_kelvin, brightness):
+    def _target_ramp(cls, temp_kelvin, brightness):
         r, g, b = cls._kelvin_to_rgb(temp_kelvin)
         try:
             brightness = max(0.0, min(1.0, float(brightness)))
         except (TypeError, ValueError):
             brightness = 1.0
         r *= brightness; g *= brightness; b *= brightness
-        ramp = cls._build_ramp(r, g, b)
+        return cls._build_ramp(r, g, b)
+
+    @classmethod
+    def _get_controller(cls):
         if cls._controller is None:
             try:
                 cls._controller = GammaController(WindowsGammaBackend())
             except (AttributeError, OSError):
-                return False
-        return cls._controller.apply(ramp)
+                return None
+        return cls._controller
+
+    @classmethod
+    def apply(cls, temp_kelvin, brightness):
+        controller = cls._get_controller()
+        if controller is None:
+            return False
+        return controller.apply(cls._target_ramp(temp_kelvin, brightness))
+
+    @classmethod
+    def ensure(cls, temp_kelvin, brightness):
+        controller = cls._get_controller()
+        if controller is None:
+            return False
+        return controller.ensure(cls._target_ramp(temp_kelvin, brightness))
 
     @classmethod
     def reset(cls):
@@ -906,11 +923,23 @@ class DesktopPet(QWidget):
         "sprout": {
             "label": "头顶小芽", "symbol": "❧", "color": "#9bd7a6",
         },
+        "round_glasses": {
+            "label": "圆框眼镜", "symbol": "◎", "color": "#8fc6d8",
+        },
         "star_pin": {
             "label": "星星别针", "symbol": "★", "color": "#e6c878",
         },
+        "heart_badge": {
+            "label": "爱心徽章", "symbol": "♥", "color": "#ef8fa3",
+        },
         "night_cap": {
             "label": "晚安帽", "symbol": "☾", "color": "#a8b2d8",
+        },
+        "moon_charm": {
+            "label": "月光吊坠", "symbol": "☾", "color": "#d8c98f",
+        },
+        "tiny_crown": {
+            "label": "星光小冠", "symbol": "♛", "color": "#f0cf78",
         },
     }
 
@@ -1707,7 +1736,7 @@ class DesktopPet(QWidget):
         pose.scale(motion["scale_x"], motion["scale_y"])
         pose.translate(-pivot_x, -pivot_y)
         art_top = self.ART_TOP.get(self._pet_kind, -13)
-        if "sprout" in self._outfit or "night_cap" in self._outfit:
+        if any(item in self._outfit for item in ("sprout", "night_cap", "tiny_crown")):
             art_top = min(art_top, -30)
         bounds = pose.mapRect(QRectF(20, top + art_top, 123, 113 - art_top))
         fit = min(1.0, (self.W - 8) / max(1, bounds.width()),
@@ -2560,6 +2589,33 @@ class DesktopPet(QWidget):
             painter.setPen(QPen(QColor("#e4dff2"), 3, Qt.SolidLine, Qt.RoundCap))
             painter.drawLine(QPointF(49, top + 12), QPointF(101, top + 12))
             self._pet_ellipse(painter, 96, top - 16, 9, 9, "#e5ca8c")
+        elif decoration == "round_glasses":
+            painter.setBrush(QColor(20, 31, 42, 38))
+            painter.setPen(QPen(QColor("#8fc6d8"), 2.2))
+            painter.drawEllipse(QRectF(47, top + 27, 23, 20))
+            painter.drawEllipse(QRectF(80, top + 27, 23, 20))
+            painter.drawLine(QPointF(70, top + 36), QPointF(80, top + 36))
+        elif decoration == "heart_badge":
+            heart = QPainterPath(QPointF(109, top + 29))
+            heart.cubicTo(98, top + 20, 96, top + 34, 109, top + 42)
+            heart.cubicTo(122, top + 34, 120, top + 20, 109, top + 29)
+            self._fill_path(painter, heart, self._pet_gradient("#ef8fa3", top + 22, 20))
+        elif decoration == "moon_charm":
+            painter.setPen(QPen(QColor("#d8c98f"), 1.7))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(QRectF(51, top + 55, 48, 27), 205 * 16, 130 * 16)
+            self._pet_ellipse(painter, 68, top + 73, 14, 14, "#e8d79a")
+            self._pet_ellipse(painter, 73, top + 69, 12, 12, "#293b48")
+        elif decoration == "tiny_crown":
+            crown = QPainterPath(QPointF(58, top + 6))
+            crown.lineTo(61, top - 12)
+            crown.lineTo(71, top - 3)
+            crown.lineTo(76, top - 16)
+            crown.lineTo(83, top - 3)
+            crown.lineTo(94, top - 12)
+            crown.lineTo(92, top + 6)
+            crown.closeSubpath()
+            self._fill_path(painter, crown, self._pet_gradient("#f0cf78", top - 16, 22), "#b9923f", 1)
 
     def _paint_ears(self, p, top, light, belly, ear_style):
         p.setPen(Qt.NoPen)
@@ -3019,6 +3075,10 @@ class PetDecorationPreview(PetPreview):
         "sprout": QRectF(56, -28, 42, 36),
         "star_pin": QRectF(100, -3, 23, 23),
         "night_cap": QRectF(43, -20, 65, 37),
+        "round_glasses": QRectF(45, 25, 60, 25),
+        "heart_badge": QRectF(95, 18, 29, 28),
+        "moon_charm": QRectF(48, 52, 55, 39),
+        "tiny_crown": QRectF(55, -19, 42, 29),
     }
 
     def __init__(self, decoration, parent=None):
@@ -3199,6 +3259,12 @@ class CareEyesApp(QWidget):
         self.countdown_timer.timeout.connect(self._refresh_countdown)
         self.countdown_timer.start(1000)
 
+        # 合并高频滑条事件，显示设备写入频率最多 25Hz。
+        self._effect_timer = QTimer(self)
+        self._effect_timer.setSingleShot(True)
+        self._effect_timer.setInterval(40)
+        self._effect_timer.timeout.connect(self.apply_effect)
+
         self.auto_timer = QTimer(self)
         self.auto_timer.timeout.connect(self._auto_mode_tick)
         self.auto_timer.start(60_000)
@@ -3318,12 +3384,13 @@ class CareEyesApp(QWidget):
             button.preview.set_outfit(progress.outfit)
         reward = progress.next_unlock
         if reward is None:
-            self.pet_reward_icon.set_decoration("star_pin")
+            self.pet_reward_icon.set_decoration(next(reversed(DesktopPet.DECORATIONS)))
             self.pet_reward_title.setText("衣柜已集齐")
             self.pet_reward_remaining.setText("继续休息，陪伴等级继续成长")
             self.pet_reward_progress.setRange(0, 1)
             self.pet_reward_progress.setValue(1)
-            self.pet_reward_count.setText("4 / 4")
+            total = len(PetProgress.OUTFIT_RULES)
+            self.pet_reward_count.setText(f"{total} / {total}")
         else:
             decoration, required = reward
             self.pet_reward_icon.set_decoration(decoration)
@@ -3416,8 +3483,6 @@ class CareEyesApp(QWidget):
         if pet_preview is not None:
             pet_preview.set_pet_kind(self.pet_kind)
             pet_preview.set_interaction_mode(self.pet_interaction_mode)
-            state = self._current_pet_state()
-            pet_preview.set_state(state)
         pet_name_label = controls.get("pet_name_label")
         if pet_name_label is not None:
             info = DesktopPet.PET_STYLES[self.pet_kind]
@@ -3443,9 +3508,17 @@ class CareEyesApp(QWidget):
                 button.blockSignals(True)
                 button.setChecked(mode == self.pet_interaction_mode)
                 button.blockSignals(False)
+        self._refresh_pet_status()
+
+    def _refresh_pet_status(self):
+        """只刷新每秒会变化的桌宠状态，避免重写整页静态控件。"""
+        controls = vars(self)
+        state = self._current_pet_state()
+        pet_preview = controls.get("pet_preview")
+        if pet_preview is not None:
+            pet_preview.set_state(state)
         pet_mood_label = controls.get("pet_mood_label")
         if pet_mood_label is not None:
-            state = self._current_pet_state()
             mood_text = {
                 "idle": "精神在线",
                 "tired": "该歇会儿了",
@@ -3713,10 +3786,18 @@ class CareEyesApp(QWidget):
         """让加载/重置后的滑条值与预设按钮状态保持一致。"""
         if not hasattr(self, "mode_btns"):
             return
+        active_name = next(
+            (name for name, preset in MODES.items()
+             if self.temp == preset["temp"]
+             and abs(self.bright - preset["bright"]) < 0.001),
+            None,
+        )
+        if (hasattr(self, "_active_mode_name")
+                and self._active_mode_name == active_name):
+            return
+        self._active_mode_name = active_name
         for name, preset in MODES.items():
-            active = (self.temp == preset["temp"]
-                      and abs(self.bright - preset["bright"]) < 0.001)
-            self.mode_btns[name].setStyleSheet(self._mode_qss(active))
+            self.mode_btns[name].setStyleSheet(self._mode_qss(name == active_name))
 
     # ══════════════════════════════════════════
     #  Page 1
@@ -4063,47 +4144,37 @@ class CareEyesApp(QWidget):
         skin_head.addWidget(skin_count)
         skin_layout.addLayout(skin_head)
 
-        skin_grid = QGridLayout()
-        skin_grid.setContentsMargins(0, 0, 0, 0)
-        skin_grid.setHorizontalSpacing(7)
-        skin_grid.setVerticalSpacing(7)
         self.pet_skin_buttons = {}
-        self.pet_more_skins = QWidget()
-        more_grid = QGridLayout(self.pet_more_skins)
-        more_grid.setContentsMargins(0, 0, 0, 0)
-        more_grid.setSpacing(7)
+        self.pet_skin_scroller = QScrollArea()
+        self.pet_skin_scroller.setWidgetResizable(True)
+        self.pet_skin_scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.pet_skin_scroller.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pet_skin_scroller.setFrameShape(QFrame.NoFrame)
+        self.pet_skin_scroller.setFixedHeight(105)
+        self.pet_skin_scroller.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollBar:horizontal{height:4px;background:#17222d;border:none;}"
+            "QScrollBar::handle:horizontal{background:#4f7b86;border-radius:2px;min-width:32px;}"
+            "QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{width:0;}"
+        )
+        self.pet_skin_strip = QWidget()
+        skin_row = QHBoxLayout(self.pet_skin_strip)
+        skin_row.setContentsMargins(0, 0, 0, 5)
+        skin_row.setSpacing(7)
         pet_order = list(DesktopPet.FEATURED_PETS) + [
             kind for kind in DesktopPet.PET_STYLES if kind not in DesktopPet.FEATURED_PETS
         ]
-        featured_count = len(DesktopPet.FEATURED_PETS)
-        for index, pet_kind in enumerate(pet_order):
+        for pet_kind in pet_order:
             info = DesktopPet.PET_STYLES[pet_kind]
             button = PetSkinCard(pet_kind, info, skin_card)
+            button.setFixedWidth(112)
             button.clicked.connect(
                 lambda _, kind=pet_kind: self._select_pet_skin(kind)
             )
             self.pet_skin_buttons[pet_kind] = button
-            if index < featured_count:
-                skin_grid.addWidget(button, index // 3, index % 3)
-            else:
-                more_index = index - featured_count
-                more_grid.addWidget(button, more_index // 3, more_index % 3)
-        for column in range(3):
-            skin_grid.setColumnStretch(column, 1)
-            more_grid.setColumnStretch(column, 1)
-        skin_layout.addLayout(skin_grid, 1)
-        self.pet_more_button = QPushButton(f"更多外观 · {len(pet_order) - featured_count} 款")
-        self.pet_more_button.setCheckable(True)
-        self.pet_more_button.setCursor(Qt.PointingHandCursor)
-        self.pet_more_button.setFixedHeight(22)
-        self.pet_more_button.setStyleSheet(
-            "QPushButton{background:transparent;border:none;color:#87abbc;font-size:10px;}"
-            "QPushButton:checked{color:#60d8ce;}"
-        )
-        self.pet_more_button.toggled.connect(self.pet_more_skins.setVisible)
-        skin_layout.addWidget(self.pet_more_button)
-        skin_layout.addWidget(self.pet_more_skins)
-        self.pet_more_skins.hide()
+            skin_row.addWidget(button)
+        self.pet_skin_scroller.setWidget(self.pet_skin_strip)
+        skin_layout.addWidget(self.pet_skin_scroller)
         side.addWidget(skin_card, 1)
 
         wardrobe = self._card()
@@ -4122,17 +4193,28 @@ class CareEyesApp(QWidget):
         )
         wardrobe_hint.setToolTip("围巾与别针可以叠穿；小芽和晚安帽共用一个头饰位置。")
         wardrobe_layout.addWidget(wardrobe_hint)
-        outfit_row = QHBoxLayout()
+        self.pet_outfit_scroller = QScrollArea()
+        self.pet_outfit_scroller.setWidgetResizable(True)
+        self.pet_outfit_scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.pet_outfit_scroller.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pet_outfit_scroller.setFrameShape(QFrame.NoFrame)
+        self.pet_outfit_scroller.setFixedHeight(96)
+        self.pet_outfit_scroller.setStyleSheet(self.pet_skin_scroller.styleSheet())
+        self.pet_outfit_strip = QWidget()
+        outfit_row = QHBoxLayout(self.pet_outfit_strip)
+        outfit_row.setContentsMargins(0, 0, 0, 5)
         outfit_row.setSpacing(6)
         self.pet_outfit_buttons = {}
         for decoration in DesktopPet.DECORATIONS:
             button = PetOutfitCard(decoration, wardrobe)
+            button.setFixedWidth(112)
             button.clicked.connect(
                 lambda _, selected=decoration: self._toggle_pet_decoration(selected)
             )
             self.pet_outfit_buttons[decoration] = button
-            outfit_row.addWidget(button, 1)
-        wardrobe_layout.addLayout(outfit_row)
+            outfit_row.addWidget(button)
+        self.pet_outfit_scroller.setWidget(self.pet_outfit_strip)
+        wardrobe_layout.addWidget(self.pet_outfit_scroller)
         side.addWidget(wardrobe)
 
         reward = self._card()
@@ -4267,7 +4349,6 @@ class CareEyesApp(QWidget):
 
     def _select_pet_skin(self, pet_kind):
         self._set_pet_kind(pet_kind)
-        self._sync_pet_page()
 
     # ══════════════════════════════════════════
     #  Page 4
@@ -4373,7 +4454,8 @@ class CareEyesApp(QWidget):
         self._transition.stop()
         self._save_settings()
         for timer_name in ("guard_timer", "stat_timer", "countdown_timer",
-                           "auto_timer", "metrics_timer", "_save_timer"):
+                           "auto_timer", "metrics_timer", "_effect_timer",
+                           "_save_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()
@@ -4472,12 +4554,18 @@ class CareEyesApp(QWidget):
         self.bright = self.bright_slider.value() / 100
         self.temp_val.setText(f"{self.temp} K")
         self.bright_val.setText(f"{int(self.bright*100)}%")
-        self._transition.stop(); self.apply_effect()
+        self._transition.stop()
+        if self.is_enabled:
+            if not self._effect_timer.isActive():
+                self._effect_timer.start()
+        else:
+            self._effect_timer.stop()
         self._sync_mode_selection()
         self._schedule_save()
 
     def apply_preset(self, name):
         p = MODES[name]
+        self._effect_timer.stop()
         if self.is_enabled:
             self._transition.start(self.temp, self.bright, p['temp'], p['bright'], 1500)
         else:
@@ -4492,6 +4580,7 @@ class CareEyesApp(QWidget):
 
     def toggle_master(self):
         self._sync_work_clock()
+        self._effect_timer.stop()
         self.is_enabled = self.toggle.isChecked()
         if self.is_enabled:
             self.toggle_label.setText("已开启")
@@ -4523,14 +4612,15 @@ class CareEyesApp(QWidget):
             DisplayManager.apply(self.temp, self.bright)
 
     def _guard_apply(self):
-        if self.is_enabled and not self._quitting and not self._transition.is_active():
-            DisplayManager.apply(self.temp, self.bright)
+        pending = vars(self).get("_effect_timer")
+        if (self.is_enabled and not self._quitting
+                and not self._transition.is_active()
+                and not (pending is not None and pending.isActive())):
+            DisplayManager.ensure(self.temp, self.bright)
 
     def apply_timer_settings(self):
         self.rest_interval_min = self.interval_spin.value()
         self.rest_duration_sec = self.duration_spin.value()
-        self._next_rest_secs = self.rest_interval_min * 60
-        self._warned_1min = False
         self._restart_rest_schedule()
         self._refresh_countdown_label()
         self._save_settings()
@@ -4721,7 +4811,7 @@ class CareEyesApp(QWidget):
         preview = vars(self).get("pet_preview")
         if (preview is not None and preview.isVisible()
                 and not preview.window().isMinimized()):
-            self._sync_pet_page()
+            self._refresh_pet_status()
         if (self._work_clock.active and 0 < self._next_rest_secs <= 60
                 and not self._warned_1min and not self._rest_deferred
                 and not self._work_clock.snooze_remaining_seconds):
@@ -4842,6 +4932,7 @@ class CareEyesApp(QWidget):
         target = int(t0 + (t1-t0)*m/60)
         self.auto_status_lbl.setText(f"自动 {target}K")
         if abs(target-self.temp) > 50:
+            self._effect_timer.stop()
             self._transition.start(self.temp,self.bright,target,self.bright,3000)
             self.temp = target
             self.temp_slider.blockSignals(True); self.temp_slider.setValue(target)
@@ -4956,6 +5047,7 @@ class CareEyesApp(QWidget):
 
     def _reset_settings(self):
         self._sync_work_clock()
+        self._effect_timer.stop()
         # 复位控件时暂时屏蔽信号，避免连续触发多次 Gamma/注册表写入。
         widgets = [self.temp_slider, self.bright_slider, self.interval_spin,
                    self.duration_spin, self.auto_toggle, self.dim_toggle,
@@ -5125,6 +5217,9 @@ class CareEyesApp(QWidget):
 
     def _save_settings(self):
         """通过 QSaveFile 提交完整配置，失败时保留旧文件并报告状态。"""
+        save_timer = vars(self).get("_save_timer")
+        if save_timer is not None:
+            save_timer.stop()
         self._sync_work_clock()
         today=date.today().isoformat()
         self._rollover_stats_if_needed(today)
